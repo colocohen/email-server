@@ -1,0 +1,68 @@
+{
+  "name": "email-server",
+  "version": "0.1.0",
+  "description": "Easily run your own mail server - complete email infrastructure with full control, in a single Node.js package with zero dependencies.",
+  "main": "index.js",
+  "type": "module",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.js",
+      "require": "./index.cjs",
+      "default": "./index.js"
+    },
+    "./wire": "./src/wire.js",
+    "./session": "./src/session.js",
+    "./message": "./src/message.js",
+    "./dkim": "./src/dkim.js"
+  },
+  "scripts": {
+    "test": "node tests/test_wire.js && node tests/test_session.js && node tests/test_message.js && node tests/test_dkim.js && node tests/test_server.js && node tests/test_session_integration.js && node tests/test_client.js && node tests/test_e2e.js"
+  },
+  "files": [
+    "index.js",
+    "index.cjs",
+    "index.d.ts",
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "keywords": [
+    "smtp", "email", "mail", "smtp-server", "smtp-client",
+    "mail-server", "email-server", "dkim", "spf", "dmarc", "rdns",
+    "mime", "rfc5321", "rfc5322", "rfc6376", "starttls", "tls",
+    "connection-pool", "nodemailer", "nodemailer-alternative",
+    "smtp-transport", "inbound", "outbound", "mta", "mail-transfer-agent",
+    "ed25519", "rsa", "signing", "verification", "authentication",
+    "anti-spam", "zero-dependencies", "pure-javascript", "nodejs"
+  ],
+  "author": "colocohen",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/colocohen/email-server.git"
+  },
+  "bugs": {
+    "url": "https://github.com/colocohen/email-server/issues"
+  },
+  "homepage": "https://github.com/colocohen/email-server#readme",
+  "funding": [
+    {
+      "type": "github",
+      "url": "https://github.com/sponsors/colocohen"
+    },
+    {
+      "type": "opencollective",
+      "url": "https://opencollective.com/colocohen"
+    },
+    {
+      "type": "buymeacoffee",
+      "url": "https://buymeacoffee.com/colocohen"
+    }
+  ],
+  "dependencies": {}
+}
