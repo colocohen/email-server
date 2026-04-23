@@ -1,5 +1,5 @@
 
-import * as dnsCache from './dns-cache.js';
+import * as dnsCache from './dns_cache.js';
 
 
 // ============================================================

@@ -795,12 +795,443 @@ function decodeBodyByTE(bodyStr, te) {
 
 
 // ============================================================
+//  Tree-based parser (byte-accurate, offset-preserving)
+//
+//  Designed for IMAP BODY[...] and BODYSTRUCTURE semantics. Unlike parseMessage
+//  which returns a flat convenience object, parseMessageTree returns a recursive
+//  node tree with exact byte offsets into the original buffer — enabling O(1)
+//  extraction of arbitrary MIME sub-parts, header subsets, and partial fetches.
+//
+//  Future direction: parseMessage will be refactored on top of parseMessageTree
+//  once the consumer APIs are unified.
+// ============================================================
+
+// CRLF bytes
+const CR = 0x0D, LF = 0x0A, SP = 0x20, HT = 0x09, DASH = 0x2D;
+
+// Find the position just after the "\r\n\r\n" that separates headers from body.
+// Returns that position, or `end` if no blank line was found (malformed — whole range is headers).
+function findHeadersBodySplit(buf, start, end) {
+  for (let i = start; i <= end - 4; i++) {
+    if (buf[i] === CR && buf[i + 1] === LF && buf[i + 2] === CR && buf[i + 3] === LF) {
+      return i + 4;
+    }
+  }
+  // Tolerate bare-LF (some malformed messages): "\n\n"
+  for (let i = start; i <= end - 2; i++) {
+    if (buf[i] === LF && buf[i + 1] === LF) return i + 2;
+  }
+  return end;
+}
+
+// Parse headers from a byte range, preserving byte offsets for each header line.
+// Returns array of { name, value, rawStart, rawEnd } where rawStart..rawEnd covers
+// the full header including any folded continuation lines and the trailing CRLF.
+// `value` is the unfolded, trimmed string value; `name` is the exact original case.
+function parseHeadersWithOffsets(buf, start, end) {
+  let out = [];
+  let i = start;
+  while (i < end) {
+    // Skip blank line that terminates headers (shouldn't happen if caller passed [start, headerEnd))
+    if (buf[i] === CR && i + 1 < end && buf[i + 1] === LF) { i += 2; break; }
+    if (buf[i] === LF) { i += 1; break; }
+
+    let lineStart = i;
+    // Find end of this logical header (including continuation lines that begin with SP/HTAB)
+    let lineEnd = i;
+    while (lineEnd < end) {
+      // Find the next CRLF (or bare LF)
+      let eol = findEol(buf, lineEnd, end);
+      if (eol < 0) { lineEnd = end; break; }
+      let afterEol = eol + (buf[eol] === CR && buf[eol + 1] === LF ? 2 : 1);
+      // Continuation?
+      if (afterEol < end && (buf[afterEol] === SP || buf[afterEol] === HT)) {
+        lineEnd = afterEol;
+        continue;
+      }
+      lineEnd = afterEol;
+      break;
+    }
+
+    // Parse "Name: value" from lineStart..lineEnd. Trim trailing CRLF for value computation.
+    let logical = buf.subarray(lineStart, lineEnd).toString('utf-8');
+    let colon = logical.indexOf(':');
+    if (colon > 0) {
+      let name = logical.slice(0, colon).trim();
+      // Unfold: replace CRLF+WSP with single space
+      let value = logical.slice(colon + 1).replace(/\r?\n[ \t]+/g, ' ').replace(/\r?\n$/, '').trim();
+      out.push({ name: name, value: value, rawStart: lineStart, rawEnd: lineEnd });
+    }
+    // else: malformed line — skip (don't add)
+
+    i = lineEnd;
+  }
+  return out;
+}
+
+function findEol(buf, start, end) {
+  for (let i = start; i < end; i++) {
+    if (buf[i] === CR || buf[i] === LF) return i;
+  }
+  return -1;
+}
+
+// Split a multipart body into child part ranges by the given boundary string.
+// Returns array of { start, end } — byte offsets of each part's content (headers + body).
+// Preamble (before first boundary) and epilogue (after close boundary) are not returned.
+//
+// RFC 2046: boundaries are "[CRLF]--<boundary>[WSP]CRLF" delimiters. Close = "[CRLF]--<boundary>--".
+// The CRLF immediately before a boundary is considered part of the boundary delimiter, not the
+// part's body — that's why parts can have zero-CRLF-terminated body and still be valid.
+function splitMultipartOffsets(buf, bodyStart, bodyEnd, boundary) {
+  if (!boundary) return [];
+  let dashBoundary = Buffer.from('--' + boundary, 'utf-8');
+  let crlfDashBoundary = Buffer.from('\r\n--' + boundary, 'utf-8');
+
+  // Collect boundary positions. Each entry records the byte offset of "--" start.
+  let markers = [];
+
+  // Case 1: boundary at very start of body (no preceding CRLF — rare but valid)
+  if (bodyEnd - bodyStart >= dashBoundary.length &&
+      buf.subarray(bodyStart, bodyStart + dashBoundary.length).equals(dashBoundary)) {
+    markers.push({ pos: bodyStart, preCRLFBytes: 0 });
+  }
+
+  // Case 2: every "\r\n--boundary" within the body
+  let search = bodyStart;
+  while (true) {
+    let idx = buf.indexOf(crlfDashBoundary, search);
+    if (idx < 0 || idx + crlfDashBoundary.length > bodyEnd) break;
+    markers.push({ pos: idx + 2, preCRLFBytes: 2 });
+    search = idx + crlfDashBoundary.length;
+  }
+
+  markers.sort(function(a, b) { return a.pos - b.pos; });
+
+  let parts = [];
+  let currentStart = null;
+  for (let j = 0; j < markers.length; j++) {
+    let m = markers[j];
+    let afterDash = m.pos + dashBoundary.length;
+    let isClose = afterDash + 1 < bodyEnd && buf[afterDash] === DASH && buf[afterDash + 1] === DASH;
+
+    // Skip past optional transport-padding (SP/HTAB) and CRLF after the boundary
+    let scanner = isClose ? afterDash + 2 : afterDash;
+    while (scanner < bodyEnd && (buf[scanner] === SP || buf[scanner] === HT)) scanner++;
+    let afterDelim;
+    if (scanner + 1 < bodyEnd && buf[scanner] === CR && buf[scanner + 1] === LF) {
+      afterDelim = scanner + 2;
+    } else if (scanner < bodyEnd && buf[scanner] === LF) {
+      afterDelim = scanner + 1;
+    } else if (isClose) {
+      afterDelim = scanner;  // close boundary at buffer end is OK
+    } else {
+      continue;  // malformed — skip this marker
+    }
+
+    // Close any previous part
+    if (currentStart !== null) {
+      // Part ends where this boundary's preceding CRLF starts
+      let partEnd = m.pos - m.preCRLFBytes;
+      parts.push({ start: currentStart, end: partEnd });
+    }
+
+    if (isClose) break;
+    currentStart = afterDelim;
+  }
+
+  return parts;
+}
+
+// Count CRLF-terminated lines in a byte range (for BODYSTRUCTURE text/* line counts).
+function countBodyLines(buf, start, end) {
+  let count = 0;
+  for (let i = start; i < end; i++) {
+    if (buf[i] === LF) count++;
+  }
+  return count;
+}
+
+// Look up a single header value by (case-insensitive) name. Returns the first match, or null.
+function findHeader(headers, name) {
+  let low = name.toLowerCase();
+  for (let i = 0; i < headers.length; i++) {
+    if (headers[i].name.toLowerCase() === low) return headers[i].value;
+  }
+  return null;
+}
+
+// Parse a MIME node recursively — the main entry point.
+// `buf` may be a Buffer, Uint8Array, or string (string gets UTF-8 encoded).
+function parseMessageTree(buf) {
+  if (typeof buf === 'string') buf = Buffer.from(buf, 'utf-8');
+  else if (buf instanceof Uint8Array && !Buffer.isBuffer(buf)) buf = Buffer.from(buf);
+  return parseMimeNode(buf, 0, buf.length);
+}
+
+// Parse a single MIME node within the given byte range and recurse for multipart children.
+function parseMimeNode(buf, start, end) {
+  let headerEnd = findHeadersBodySplit(buf, start, end);
+  let bodyStart = headerEnd;
+  let bodyEnd = end;
+
+  // Parse headers — note: the blank line is NOT included in our header range
+  let headers = parseHeadersWithOffsets(buf, start, headerEnd);
+
+  // Extract commonly-needed header values (pre-computed so BODYSTRUCTURE builder
+  // doesn't have to walk headers repeatedly)
+  let ctRaw = findHeader(headers, 'Content-Type');
+  let ct = parseContentType(ctRaw);
+  let cte = findHeader(headers, 'Content-Transfer-Encoding');
+  let cd = findHeader(headers, 'Content-Disposition');
+  let cdParsed = parseContentDisposition(cd);
+
+  let parts = null;
+
+  if (ct.type === 'multipart' && ct.params.boundary) {
+    // Recurse for each part
+    let childRanges = splitMultipartOffsets(buf, bodyStart, bodyEnd, ct.params.boundary);
+    parts = [];
+    for (let i = 0; i < childRanges.length; i++) {
+      parts.push(parseMimeNode(buf, childRanges[i].start, childRanges[i].end));
+    }
+  } else if (ct.type === 'message' && ct.subtype === 'rfc822') {
+    // An embedded RFC822 message: the body IS another complete message.
+    // Per RFC 3501 §7.4.2, BODYSTRUCTURE treats this as a single encapsulated child.
+    parts = [parseMimeNode(buf, bodyStart, bodyEnd)];
+  }
+
+  return {
+    // Byte offsets (all absolute into the root buffer)
+    start:       start,
+    end:         end,
+    headerStart: start,
+    headerEnd:   headerEnd,
+    bodyStart:   bodyStart,
+    bodyEnd:     bodyEnd,
+
+    // Parsed header summary (pre-computed for speed)
+    contentType:              ct.type + '/' + ct.subtype,
+    contentTypeParams:        ct.params,
+    contentTransferEncoding:  cte ? cte.trim().toLowerCase() : null,
+    contentDisposition:       cdParsed.type,
+    contentDispositionParams: cdParsed.params,
+    contentId:                findHeader(headers, 'Content-ID'),
+    contentDescription:       findHeader(headers, 'Content-Description'),
+    contentLanguage:          findHeader(headers, 'Content-Language'),
+    contentLocation:          findHeader(headers, 'Content-Location'),
+    contentMd5:               findHeader(headers, 'Content-MD5'),
+
+    // Full header list (preserves order, duplicates, and byte offsets)
+    headers: headers,
+
+    // Body line count (for BODYSTRUCTURE of text/* and message/* parts)
+    bodyLines: countBodyLines(buf, bodyStart, bodyEnd),
+
+    // Recursive child parts (null for leaf/single-body parts)
+    parts: parts
+  };
+}
+
+function parseContentDisposition(v) {
+  if (!v) return { type: null, params: {} };
+  let s = String(v);
+  let semi = s.indexOf(';');
+  let type = (semi < 0 ? s : s.slice(0, semi)).trim().toLowerCase();
+  let params = {};
+  if (semi >= 0) {
+    let rx = /;\s*([^\s=;]+)\s*=\s*(?:"([^"]*)"|([^;\s]*))/g;
+    let m;
+    while ((m = rx.exec(s))) {
+      params[m[1].toLowerCase()] = m[2] !== undefined ? m[2] : m[3];
+    }
+  }
+  return { type: type || null, params: params };
+}
+
+
+// ============================================================
+//  Address-list parser (RFC 5322 pragmatic subset)
+//
+//  Handles: bare addresses, name-addr ("Alice" <a@x>), display name in various
+//  forms (quoted, atoms, encoded-words left raw), comments in parens (skipped),
+//  groups ("My Group": a@x, b@y;).
+//
+//  Returns a flat array where each element is either:
+//    { name, mailbox, host }                 — a normal address
+//    { group: 'name', members: [addr,...] }  — a group construct
+//
+//  Strings are returned raw (not decoded). Callers that need decoded display
+//  names should apply decodeEncodedWords themselves.
+// ============================================================
+
+function parseAddressList(str) {
+  if (!str) return [];
+  let st = { s: String(str), i: 0 };
+  let out = [];
+  apSkipCfws(st);
+  while (st.i < st.s.length) {
+    if (st.s.charAt(st.i) === ',') { st.i++; apSkipCfws(st); continue; }
+    let a = apReadAddressOrGroup(st);
+    if (a) out.push(a);
+    apSkipCfws(st);
+  }
+  return out;
+}
+
+// Skip whitespace and RFC 5322 comments (which may be nested).
+function apSkipCfws(st) {
+  while (st.i < st.s.length) {
+    let c = st.s.charAt(st.i);
+    if (c === ' ' || c === '\t' || c === '\r' || c === '\n') { st.i++; continue; }
+    if (c === '(') { apSkipComment(st); continue; }
+    break;
+  }
+}
+
+function apSkipComment(st) {
+  let depth = 1;
+  st.i++;  // consume '('
+  while (st.i < st.s.length && depth > 0) {
+    let c = st.s.charAt(st.i);
+    if (c === '\\' && st.i + 1 < st.s.length) { st.i += 2; continue; }
+    if (c === '(') depth++;
+    else if (c === ')') depth--;
+    st.i++;
+  }
+}
+
+// Read a quoted-string. Current char is assumed to be '"'.
+function apReadQuoted(st) {
+  st.i++;  // consume opening "
+  let out = '';
+  while (st.i < st.s.length) {
+    let c = st.s.charAt(st.i);
+    if (c === '"') { st.i++; return out; }
+    if (c === '\\' && st.i + 1 < st.s.length) { out += st.s.charAt(st.i + 1); st.i += 2; continue; }
+    out += c;
+    st.i++;
+  }
+  return out;  // unterminated — return what we read
+}
+
+// Read an atom — any run of non-special characters.
+function apReadAtom(st) {
+  let out = '';
+  while (st.i < st.s.length) {
+    let c = st.s.charAt(st.i);
+    if (c === ' ' || c === '\t' || c === '\r' || c === '\n') break;
+    if ('"<>()@,:;'.indexOf(c) >= 0) break;
+    out += c;
+    st.i++;
+  }
+  return out;
+}
+
+// Read either a single address or a group, depending on context.
+function apReadAddressOrGroup(st) {
+  // Collect name words until we see '<', '@' following an atom, ':', ',', ';', or end
+  let nameParts = [];
+  let localPart = null;
+  let domain = null;
+  let hasAngle = false;
+
+  while (st.i < st.s.length) {
+    apSkipCfws(st);
+    if (st.i >= st.s.length) break;
+    let c = st.s.charAt(st.i);
+
+    if (c === ',' || c === ';') break;
+
+    if (c === ':') {
+      // Group start — everything collected so far is the group name
+      st.i++;
+      let gname = nameParts.join(' ').trim();
+      let members = [];
+      apSkipCfws(st);
+      while (st.i < st.s.length && st.s.charAt(st.i) !== ';') {
+        if (st.s.charAt(st.i) === ',') { st.i++; apSkipCfws(st); continue; }
+        let m = apReadAddressOrGroup(st);
+        if (m) members.push(m);
+        apSkipCfws(st);
+      }
+      if (st.i < st.s.length && st.s.charAt(st.i) === ';') st.i++;
+      return { group: gname || null, members: members };
+    }
+
+    if (c === '"') {
+      nameParts.push(apReadQuoted(st));
+      continue;
+    }
+
+    if (c === '<') {
+      // Angle-bracketed address — overrides any previous local@host
+      hasAngle = true;
+      st.i++;  // consume <
+      apSkipCfws(st);
+      let lp = apReadAtom(st);
+      if (st.s.charAt(st.i) === '"') lp = apReadQuoted(st);
+      apSkipCfws(st);
+      if (st.s.charAt(st.i) === '@') {
+        st.i++;
+        apSkipCfws(st);
+        let d = apReadAtom(st);
+        localPart = lp;
+        domain = d;
+      } else {
+        // Bare local part in brackets (unusual but legal)
+        localPart = lp;
+      }
+      apSkipCfws(st);
+      if (st.s.charAt(st.i) === '>') st.i++;
+      continue;
+    }
+
+    // Atom — could be part of display name, or the local part of an email
+    let atom = apReadAtom(st);
+    if (!atom) { st.i++; continue; }  // unexpected — advance to avoid infinite loop
+
+    // Lookahead: if next non-ws char is '@', this atom is the local part
+    let save = st.i;
+    apSkipCfws(st);
+    if (st.s.charAt(st.i) === '@' && !hasAngle) {
+      st.i++;
+      apSkipCfws(st);
+      let d = apReadAtom(st);
+      localPart = atom;
+      domain = d;
+      continue;
+    }
+    // Otherwise, it's part of the display name
+    st.i = save;
+    nameParts.push(atom);
+  }
+
+  let name = nameParts.join(' ').trim();
+  if (!localPart && !domain && !name) return null;
+  return {
+    name: name || null,
+    mailbox: localPart || null,
+    host: domain || null
+  };
+}
+
+
+// ============================================================
 //  Exports
 // ============================================================
 
 export {
   composeMessage,
   parseMessage,
+
+  // Tree-based parser (byte-accurate, for IMAP BODY[...] / BODYSTRUCTURE)
+  parseMessageTree,
+  findHeadersBodySplit,
+  parseHeadersWithOffsets,
+  splitMultipartOffsets,
+  countBodyLines,
+  parseAddressList,
 
   // Encoding utilities
   base64Encode,

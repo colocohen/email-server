@@ -1,8 +1,8 @@
 
 import { EventEmitter } from 'node:events';
 
-import { SMTPConnection } from './client.js';
-import * as dnsCache from './dns-cache.js';
+import { SMTPConnection } from './smtp_client.js';
+import * as dnsCache from './dns_cache.js';
 
 
 // ============================================================
@@ -59,7 +59,7 @@ function OutboundPool(options) {
 
 
   // ============================================================
-  //  MX lookup (uses shared dns-cache)
+  //  MX lookup (uses shared dns_cache)
   // ============================================================
 
   function getMX(domain, cb) {

@@ -1,7 +1,7 @@
 
 import crypto from 'node:crypto';
 
-import * as dnsCache from './dns-cache.js';
+import * as dnsCache from './dns_cache.js';
 import { toU8, u8ToStr, parseTags, parseMailHeaders } from './utils.js';
 
 
