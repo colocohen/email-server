@@ -7,6 +7,7 @@ import { composeMessage } from './message.js';
 import { toU8, u8ToStr, extractAddress, extractAddressList,
          domainToAscii, addressNeedsSmtputf8, addressForAsciiOnlyPeer } from './utils.js';
 import * as dnsCache from './dns_cache.js';
+import * as mtaSts from './mta_sts.js';
 
 
 // ============================================================
@@ -78,10 +79,17 @@ function SMTPConnection(options, cb) {
 
   // STARTTLS event — upgrade socket to TLS
   session.on('starttls', function() {
+    // Certificate posture:
+    //   default (opportunistic TLS): rejectUnauthorized=false — much of the
+    //   world's MX fleet has broken/self-signed certs, and refusing them
+    //   means refusing to deliver mail at all.
+    //   MTA-STS enforce (options.verifyTLS=true): full validation with the
+    //   MX hostname as SNI/verify name — an unvalidated cert here would
+    //   defeat the whole point of the policy (RFC 8461 §4.2).
     let tlsSocket = tls.connect({
       socket: socket,
-      servername: host,
-      rejectUnauthorized: false
+      servername: options.tlsServername || host,
+      rejectUnauthorized: !!options.verifyTLS
     });
 
     tlsSocket.on('error', function(err) {
@@ -252,21 +260,68 @@ function sendMail(options, cb) {
 // ============================================================
 
 function deliverToDomain(domain, envFrom, recipients, rawMessage, options, cb) {
+  // RFC 8461: discover the recipient domain's MTA-STS policy first. A null
+  // policy (none published / lookup failed) means classic opportunistic
+  // delivery. mode=enforce changes three things below: MX filtering,
+  // mandatory STARTTLS, and full certificate validation.
+  // Opt out entirely with options.mtaSts === false.
+  if (options.mtaSts === false) {
+    return deliverToDomainWithPolicy(domain, envFrom, recipients, rawMessage, options, null, cb);
+  }
+  mtaSts.getPolicy(domain, function(err, policy) {
+    deliverToDomainWithPolicy(domain, envFrom, recipients, rawMessage, options, policy || null, cb);
+  });
+}
+
+function deliverToDomainWithPolicy(domain, envFrom, recipients, rawMessage, options, policy, cb) {
+  let enforce = !!(policy && policy.mode === 'enforce');
+
   resolveMX(domain, function(err, mxRecords) {
     if (err) return cb(err);
+
+    // Under enforce, only MX hosts matching the policy may be used at all
+    // (RFC 8461 §5.1). If nothing matches, delivery MUST NOT proceed — fail
+    // as transient so the pool retries/queues instead of hard-bouncing.
+    if (enforce) {
+      let allowed = mxRecords.filter(function(mx) {
+        return mtaSts.mxMatchesPolicy(mx.exchange, policy);
+      });
+      if (allowed.length === 0) {
+        let e = new Error('MTA-STS enforce: no MX for ' + domain + ' matches the published policy');
+        e.transient = true;
+        return cb(e);
+      }
+      mxRecords = allowed;
+    }
+
     let mxIndex = 0;
 
     function tryNextMX() {
-      if (mxIndex >= mxRecords.length) return cb(new Error('All MX failed for ' + domain));
+      if (mxIndex >= mxRecords.length) {
+        let e = new Error('All MX failed for ' + domain + (enforce ? ' (MTA-STS enforce)' : ''));
+        if (enforce) e.transient = true;
+        return cb(e);
+      }
       let mx = mxRecords[mxIndex++];
 
       SMTPConnection({
         host: mx.exchange, port: 25,
         localHostname: options.localHostname || 'localhost',
         timeout: options.timeout || 30000,
-        ignoreTLS: options.ignoreTLS || false
+        ignoreTLS: options.ignoreTLS || false,
+        // MTA-STS enforce: validated TLS against the MX hostname.
+        verifyTLS: enforce,
+        tlsServername: mx.exchange
       }, function(err, conn) {
         if (err) return tryNextMX();
+
+        // Under enforce, TLS is not optional: if the connection did not end
+        // up encrypted (peer lacks STARTTLS or the upgrade failed), this MX
+        // may not be used (RFC 8461 §4.2). Try the next allowed one.
+        if (enforce && !conn.isTLS) {
+          conn.destroy();
+          return tryNextMX();
+        }
 
         // After EHLO, `conn.capabilities` reflects the peer's supported
         // extensions. Decide the SMTPUTF8 posture for this transaction:

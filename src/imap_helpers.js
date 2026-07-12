@@ -1071,7 +1071,124 @@ function treeToBodyStructureJson(tree) {
 //  Exports
 // ============================================================
 
+
+// ============================================================
+//  Modified UTF-7 mailbox-name codec (RFC 3501 §5.1.3)
+// ============================================================
+//
+//  IMAP4rev1 mailbox names use "modified UTF-7": non-ASCII runs are encoded
+//  as "&<modified-base64>-" with ',' instead of '/' in the base64 alphabet,
+//  and a literal '&' is written "&-". The payload is UTF-16BE.
+//
+//  Every pre-rev2 client (Thunderbird, Outlook, Apple Mail, K-9, ...) sends
+//  and expects folder names in this form. Without the codec, a Hebrew folder
+//  "קבלות" reaches the developer's openFolder handler as the raw wire string
+//  "&BeEF0QXcBd0F6g-", and developer-supplied UTF-8 names get shipped as
+//  literals that many clients render incorrectly. The session layer decodes
+//  every inbound mailbox argument and encodes every outbound mailbox name,
+//  so the developer works purely in UTF-8 and never sees mUTF-7.
+
+const MB64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+,';
+const MB64_REV = (function() {
+  let m = {};
+  for (let i = 0; i < MB64.length; i++) m[MB64[i]] = i;
+  return m;
+})();
+
+// Encode a UTF-8 JS string to modified UTF-7 for the wire.
+function mutf7Encode(name) {
+  let s = String(name == null ? '' : name);
+  let out = '';
+  let i = 0;
+  while (i < s.length) {
+    let c = s.charCodeAt(i);
+    if (c === 0x26) {            // '&' → "&-"
+      out += '&-';
+      i++;
+      continue;
+    }
+    if (c >= 0x20 && c <= 0x7E) { // printable ASCII passes through
+      out += s[i];
+      i++;
+      continue;
+    }
+    // Collect a run of non-ASCII (and control) chars, encode as UTF-16BE b64
+    let runStart = i;
+    while (i < s.length) {
+      let cc = s.charCodeAt(i);
+      if (cc >= 0x20 && cc <= 0x7E) break;
+      i++;
+    }
+    let run = s.slice(runStart, i);
+    // UTF-16BE bytes (charCodeAt already gives UTF-16 code units, incl. surrogates)
+    let bytes = [];
+    for (let j = 0; j < run.length; j++) {
+      let u = run.charCodeAt(j);
+      bytes.push((u >> 8) & 0xFF, u & 0xFF);
+    }
+    // modified base64: no padding, ',' for '/'
+    let b64 = '';
+    for (let j = 0; j < bytes.length; j += 3) {
+      let b0 = bytes[j], b1 = bytes[j + 1], b2 = bytes[j + 2];
+      b64 += MB64[b0 >> 2];
+      b64 += MB64[((b0 & 3) << 4) | ((b1 === undefined ? 0 : b1) >> 4)];
+      if (b1 === undefined) break;
+      b64 += MB64[((b1 & 15) << 2) | ((b2 === undefined ? 0 : b2) >> 6)];
+      if (b2 === undefined) break;
+      b64 += MB64[b2 & 63];
+    }
+    out += '&' + b64 + '-';
+  }
+  return out;
+}
+
+// Decode a wire mailbox name from modified UTF-7 to a UTF-8 JS string.
+// Lenient: malformed sequences are passed through unchanged rather than
+// throwing — a broken client shouldn't crash the session.
+function mutf7Decode(name) {
+  let s = String(name == null ? '' : name);
+  if (s.indexOf('&') < 0) return s;      // fast path — pure ASCII
+  let out = '';
+  let i = 0;
+  while (i < s.length) {
+    let ch = s[i];
+    if (ch !== '&') { out += ch; i++; continue; }
+    // "&-" is a literal ampersand
+    if (s[i + 1] === '-') { out += '&'; i += 2; continue; }
+    // Find the closing '-'
+    let end = s.indexOf('-', i + 1);
+    if (end < 0) { out += s.slice(i); break; }   // malformed — pass through
+    let b64 = s.slice(i + 1, end);
+    // decode modified base64 → bytes
+    let bits = 0, nbits = 0, bytes = [];
+    let bad = false;
+    for (let j = 0; j < b64.length; j++) {
+      let v = MB64_REV[b64[j]];
+      if (v === undefined) { bad = true; break; }
+      bits = (bits << 6) | v;
+      nbits += 6;
+      if (nbits >= 8) {
+        nbits -= 8;
+        bytes.push((bits >> nbits) & 0xFF);
+      }
+    }
+    if (bad || bytes.length % 2 !== 0) {
+      out += s.slice(i, end + 1);                // malformed — pass through
+      i = end + 1;
+      continue;
+    }
+    // UTF-16BE code units → string (surrogate pairs combine naturally)
+    for (let j = 0; j < bytes.length; j += 2) {
+      out += String.fromCharCode((bytes[j] << 8) | bytes[j + 1]);
+    }
+    i = end + 1;
+  }
+  return out;
+}
+
 export {
+  mutf7Encode,
+  mutf7Decode,
   // Constants
   SPECIAL_USE,
   FLAGS,

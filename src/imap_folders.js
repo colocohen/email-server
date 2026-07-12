@@ -49,6 +49,8 @@
 
 import { TOK } from './imap_wire.js';
 import {
+  mutf7Encode,
+  mutf7Decode,
   FLAGS,
   DEFAULT_FLAGS,
   normalizeSpecialUse,
@@ -72,6 +74,7 @@ export function registerFolderHandlers(s) {
   const sendUntagged      = s.sendUntagged;
   const send              = s.send;
   const getStringValue    = s.getStringValue;
+  const getMailboxName    = s.getMailboxName;
   const emitFetchResponse = s.emitFetchResponse;
   const requireSelected   = s.requireSelected;
 
@@ -142,7 +145,7 @@ export function registerFolderHandlers(s) {
       sendTagged(tag, 'BAD', 'LIST requires reference');
       return;
     }
-    let reference = getStringValue(args[cursor++]);
+    let reference = mutf7Decode(getStringValue(args[cursor++]));
 
     if (cursor >= args.length) {
       sendTagged(tag, 'BAD', 'LIST requires mailbox pattern');
@@ -153,10 +156,10 @@ export function registerFolderHandlers(s) {
     let patTok = args[cursor++];
     if (patTok.type === TOK.LIST) {
       for (let i = 0; i < patTok.value.length; i++) {
-        patterns.push(getStringValue(patTok.value[i]));
+        patterns.push(mutf7Decode(getStringValue(patTok.value[i])));
       }
     } else {
-      patterns.push(getStringValue(patTok));
+      patterns.push(mutf7Decode(getStringValue(patTok)));
     }
 
     // RETURN clause (optional): atom 'RETURN' followed by a LIST
@@ -289,26 +292,18 @@ export function registerFolderHandlers(s) {
         if (done) done();
         return;
       }
-      let parts = [];
-      for (let i = 0; i < items.length; i++) {
-        let k = items[i];
-        let v;
-        switch (k) {
-          case 'MESSAGES':      v = stats.messages;      break;
-          case 'UIDNEXT':       v = stats.uidnext;       break;
-          case 'UIDVALIDITY':   v = stats.uidvalidity;   break;
-          case 'UNSEEN':        v = stats.unseen;        break;
-          case 'RECENT':        v = stats.recent;        break;
-          case 'HIGHESTMODSEQ': v = stats.highestmodseq; break;
-          case 'DELETED':       v = stats.deleted;       break;
-          case 'SIZE':          v = stats.size;          break;
-          default:              v = undefined;
-        }
-        if (v != null) parts.push(k + ' ' + v);
-      }
-      sendUntagged('STATUS ' + quoteMailbox(name) + ' (' + parts.join(' ') + ')');
+      emitStatusLine(name, items, stats);
       if (done) done();
     });
+  }
+
+  // First non-null of stats[key1], stats[key2]...
+  function pick(obj) {
+    for (let i = 1; i < arguments.length; i++) {
+      let v = obj[arguments[i]];
+      if (v != null) return v;
+    }
+    return undefined;
   }
 
   // --- SELECT / EXAMINE (shared; `readOnly` chooses) ---
@@ -319,7 +314,7 @@ export function registerFolderHandlers(s) {
       return;
     }
 
-    let name = getStringValue(args[0]);
+    let name = getMailboxName(args[0]);
 
     // RFC 7162 §3.1.8 / §3.2.5: optional parameter list
     //   SELECT mbox (CONDSTORE)
@@ -486,7 +481,7 @@ export function registerFolderHandlers(s) {
       sendTagged(tag, 'BAD', 'CREATE requires mailbox name');
       return;
     }
-    let name = getStringValue(args[0]);
+    let name = getMailboxName(args[0]);
 
     // RFC 3501 §6.3.3: trailing hierarchy delimiter is a hint that the client
     // intends to create names under this one. Most servers strip and create normally.
@@ -543,7 +538,7 @@ export function registerFolderHandlers(s) {
       sendTagged(tag, 'BAD', 'DELETE requires mailbox name');
       return;
     }
-    let name = getStringValue(args[0]);
+    let name = getMailboxName(args[0]);
 
     if (name.toUpperCase() === 'INBOX') {
       sendTagged(tag, 'NO', 'Cannot delete INBOX');
@@ -572,8 +567,8 @@ export function registerFolderHandlers(s) {
       sendTagged(tag, 'BAD', 'RENAME requires old and new names');
       return;
     }
-    let oldName = getStringValue(args[0]);
-    let newName = getStringValue(args[1]);
+    let oldName = getMailboxName(args[0]);
+    let newName = getMailboxName(args[1]);
 
     // If the renamed folder is currently selected, drop the selection.
     if (context.state === STATE.SELECTED && context.currentFolder === oldName) {
@@ -596,7 +591,7 @@ export function registerFolderHandlers(s) {
       sendTagged(tag, 'BAD', 'SUBSCRIBE requires mailbox name');
       return;
     }
-    let name = getStringValue(args[0]);
+    let name = getMailboxName(args[0]);
     ev.emit('subscribe', name, function(err) {
       if (err) {
         sendTagged(tag, 'NO', err.message || 'Cannot subscribe');
@@ -612,7 +607,7 @@ export function registerFolderHandlers(s) {
       sendTagged(tag, 'BAD', 'UNSUBSCRIBE requires mailbox name');
       return;
     }
-    let name = getStringValue(args[0]);
+    let name = getMailboxName(args[0]);
     ev.emit('unsubscribe', name, function(err) {
       if (err) {
         sendTagged(tag, 'NO', err.message || 'Cannot unsubscribe');
@@ -629,7 +624,7 @@ export function registerFolderHandlers(s) {
       sendTagged(tag, 'BAD', 'STATUS requires mailbox name and items');
       return;
     }
-    let name = getStringValue(args[0]);
+    let name = getMailboxName(args[0]);
     if (args[1].type !== TOK.LIST) {
       sendTagged(tag, 'BAD', 'STATUS items must be a parenthesized list');
       return;
@@ -642,6 +637,10 @@ export function registerFolderHandlers(s) {
       if (v) requestedItems.push(v);
     }
 
+    // Delegate to the shared emitter — single code path for both the direct
+    // STATUS command and LIST RETURN (STATUS ...), with full item coverage
+    // (MESSAGES / RECENT / UIDNEXT / UIDVALIDITY / UNSEEN / HIGHESTMODSEQ /
+    // DELETED / SIZE), accepting both camelCase and lowercase stat keys.
     ev.emit('status', name, requestedItems, function(err, info) {
       if (err) {
         sendTagged(tag, 'NO', err.message || 'Cannot get status');
@@ -651,23 +650,31 @@ export function registerFolderHandlers(s) {
         sendTagged(tag, 'NO', 'Folder not found');
         return;
       }
-
-      // Build response items from what the developer provided, in the requested order
-      let parts = [];
-      for (let i = 0; i < requestedItems.length; i++) {
-        let item = requestedItems[i];
-        let val = null;
-        if      (item === 'MESSAGES'    && info.messages    != null) val = info.messages;
-        else if (item === 'RECENT'      && info.recent      != null) val = info.recent;
-        else if (item === 'UIDNEXT'     && info.uidNext     != null) val = info.uidNext;
-        else if (item === 'UIDVALIDITY' && info.uidValidity != null) val = info.uidValidity;
-        else if (item === 'UNSEEN'      && info.unseen      != null) val = info.unseen;
-        if (val != null) parts.push(item + ' ' + val);
-      }
-
-      sendUntagged('STATUS ' + quoteMailbox(name) + ' (' + parts.join(' ') + ')');
+      emitStatusLine(name, requestedItems, info);
       sendTagged(tag, 'OK', 'STATUS completed');
     });
+  }
+
+  // Shared STATUS line formatter used by handleStatus and emitStatusForFolder.
+  function emitStatusLine(name, items, stats) {
+    let parts = [];
+    for (let i = 0; i < items.length; i++) {
+      let k = items[i];
+      let v;
+      switch (k) {
+        case 'MESSAGES':      v = pick(stats, 'messages');                     break;
+        case 'UIDNEXT':       v = pick(stats, 'uidnext', 'uidNext');           break;
+        case 'UIDVALIDITY':   v = pick(stats, 'uidvalidity', 'uidValidity');   break;
+        case 'UNSEEN':        v = pick(stats, 'unseen');                       break;
+        case 'RECENT':        v = pick(stats, 'recent');                       break;
+        case 'HIGHESTMODSEQ': v = pick(stats, 'highestmodseq', 'highestModseq'); break;
+        case 'DELETED':       v = pick(stats, 'deleted');                      break;
+        case 'SIZE':          v = pick(stats, 'size');                         break;
+        default:              v = undefined;
+      }
+      if (v != null) parts.push(k + ' ' + v);
+    }
+    sendUntagged('STATUS ' + quoteMailbox(name) + ' (' + parts.join(' ') + ')');
   }
 
   // --- CLOSE (discards deletions, exits SELECTED) ---
@@ -696,19 +703,14 @@ export function registerFolderHandlers(s) {
   // Quote a mailbox name for wire — uses quoted string if possible, else literal.
   // Reuses the tested quoteString logic from imap_wire's serializer.
   function quoteMailbox(name) {
-    // Mailbox names in LIST/LSUB/STATUS responses are traditionally quoted strings,
-    // even when they'd be atom-safe. We always quote for consistency.
-    let hasSpecial = false;
-    for (let i = 0; i < name.length; i++) {
-      let c = name.charCodeAt(i);
-      if (c === 13 || c === 10 || c === 0 || c > 127) { hasSpecial = true; break; }
-    }
-    if (hasSpecial) {
-      // Needs literal
-      let buf = Buffer.from(name, 'utf-8');
-      return '{' + buf.length + '}\r\n' + name;
-    }
-    return '"' + name.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+    // Encode to modified UTF-7 first (RFC 3501 §5.1.3): IMAP4rev1 clients
+    // expect international mailbox names as "&...-" sequences, not UTF-8.
+    // The developer supplies clean UTF-8 ("קבלות"); the wire gets
+    // "&BecF0QXcBdUF6g-". After encoding, the name is printable ASCII, so a
+    // quoted string always suffices (the old literal path sent raw UTF-8,
+    // which many clients rendered as mojibake).
+    let wire = mutf7Encode(name);
+    return '"' + wire.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
   }
 
 
@@ -725,7 +727,7 @@ export function registerFolderHandlers(s) {
       return;
     }
 
-    let folder = getStringValue(args[0]);
+    let folder = getMailboxName(args[0]);
     let flags = null;
     let internalDate = null;
     let literal = null;
@@ -755,13 +757,29 @@ export function registerFolderHandlers(s) {
     }
 
     let raw = Buffer.isBuffer(literal) ? literal : Buffer.from(literal);
+
+    // RFC 7889 APPENDLIMIT — second enforcement point. The feedServer-level
+    // check rejects BEFORE the bytes are buffered, but a LITERAL+ message
+    // whose bytes arrive in the same TCP read as the command line is parsed
+    // whole and never passes through NEED_CONTINUATION; catch it here.
+    if (context.maxAppendSize > 0 && raw.length > context.maxAppendSize) {
+      sendTagged(tag, 'NO',
+        'Message exceeds APPENDLIMIT (' + context.maxAppendSize + ' bytes)', 'TOOBIG');
+      return;
+    }
+
     let options = {};
     if (flags)        options.flags = flags;
     if (internalDate) options.internalDate = internalDate;
 
     ev.emit('append', folder, raw, options, function(err, result) {
       if (err) {
-        sendTagged(tag, 'NO', err.message || 'APPEND failed');
+        // RFC 3501 §6.3.11: when the failure is "target mailbox doesn't
+        // exist", the server SHOULD answer NO [TRYCREATE] so the client
+        // creates it and retries. The developer signals this by setting
+        // err.tryCreate = true (or err.code = 'TRYCREATE') in the callback.
+        let code = (err.tryCreate || err.code === 'TRYCREATE') ? 'TRYCREATE' : null;
+        sendTagged(tag, 'NO', err.message || 'APPEND failed', code);
         return;
       }
       // RFC 4315 APPENDUID: if developer returned both uid and uidValidity, advertise it
@@ -838,7 +856,7 @@ export function registerFolderHandlers(s) {
     }
 
     let setStr = getStringValue(args[0]);
-    let dst    = getStringValue(args[1]);
+    let dst    = getMailboxName(args[1]);
     let parsed = parseSequenceSet(setStr, { isUid: byUid, total: context.currentFolderTotal });
     if (parsed.error) {
       sendTagged(tag, 'BAD', 'Invalid sequence set: ' + parsed.error);
@@ -859,7 +877,8 @@ export function registerFolderHandlers(s) {
 
         ev.emit('move', context.currentFolder, uids, dst, function(err, mapping) {
           if (err) {
-            sendTagged(tag, 'NO', err.message || 'MOVE failed');
+            let tcCode = (err.tryCreate || err.code === 'TRYCREATE') ? 'TRYCREATE' : null;
+          sendTagged(tag, 'NO', err.message || 'MOVE failed', tcCode);
             return;
           }
           // RFC 6851: send untagged "OK [COPYUID ...]" BEFORE the EXPUNGEs.
@@ -1016,7 +1035,7 @@ export function registerFolderHandlers(s) {
       sendTagged(tag, 'NO', 'Quota not implemented');
       return;
     }
-    let mailbox = getStringValue(args[0]);
+    let mailbox = getMailboxName(args[0]);
 
     // If the developer didn't register quotaRoot, fall back to a single
     // implicit root named "" that we query via the 'quota' event.

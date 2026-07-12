@@ -380,11 +380,22 @@ function parsePathWithParams(rest, expectedKey) {
   let re = RE_PATH[expectedKey];
   if (!re) re = new RegExp('^(' + expectedKey + ')\\s*:\\s*<([^>]*)>\\s*(.*)$', 'i');
   let m = re.exec(rest);
-  if (!m) return { err: true };
-  let address = m[2];
-  let tail = (m[3] || '').trim();
-  let params = parseEsmtpParams(tail);
-  return { address: address, params: params };
+  if (m) {
+    let tail = (m[3] || '').trim();
+    return { address: m[2], params: parseEsmtpParams(tail) };
+  }
+
+  // Lenient fallback: RFC 5321 requires angle brackets, but decades of
+  // clients and scripts send "MAIL FROM:user@host" bare. Postfix and most
+  // production MTAs accept it (strict_rfc821_envelopes=no is the default).
+  // We accept a bare address token — first whitespace-delimited word after
+  // the colon — and treat the remainder as ESMTP params as usual.
+  let lm = new RegExp('^' + expectedKey + '\\s*:\\s*(\\S+)\\s*(.*)$', 'i').exec(rest);
+  if (lm && lm[1].indexOf('<') < 0 && lm[1].indexOf('>') < 0) {
+    return { address: lm[1], params: parseEsmtpParams((lm[2] || '').trim()) };
+  }
+
+  return { err: true };
 }
 
 function parseEsmtpParams(tail) {

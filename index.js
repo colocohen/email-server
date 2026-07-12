@@ -31,7 +31,7 @@ import { composeMessage, parseMessage } from './src/message.js';
 import { sendMail, resolveMX } from './src/smtp_client.js';
 
 // DSN (RFC 3461/3464)
-import { buildDsn } from './src/dsn.js';
+import { buildDsn, parseDsn } from './src/dsn.js';
 
 // Auth checks
 import { sign as dkimSign, verify as dkimVerify } from './src/dkim.js';
@@ -72,6 +72,7 @@ export {
 
   // DSN
   buildDsn,
+  parseDsn,
 
   // Auth checks (standalone)
   dkimSign,
@@ -111,6 +112,7 @@ export default {
   sendMail,
   resolveMX,
   buildDsn,
+  parseDsn,
   dkimSign,
   dkimVerify,
   checkSPF,

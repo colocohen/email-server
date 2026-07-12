@@ -76,28 +76,37 @@ const DEFAULT_AUTH_METHODS = ['PLAIN', 'XOAUTH2'];
 // without the trailing terminator — caller adds those).
 
 function dotStuff(raw) {
-  // Work byte-wise to avoid UTF-8 splitting of binary content.
-  let out = [];
+  // Two-pass, Buffer-based. The previous version pushed every byte onto a
+  // plain JS array — for a 10 MB message that's a 10-million-element boxed
+  // array (huge allocation + GC churn). Here we count the dots that need
+  // stuffing first, allocate one exact-size Buffer, then fill it. Zero boxing.
   let len = raw.length;
+
+  // Pass 1: count line-leading dots (each needs one extra byte).
+  let extra = 0;
   let lineStart = true;
   for (let i = 0; i < len; i++) {
     let b = raw[i];
-    if (lineStart && b === 0x2E /* '.' */) {
-      out.push(0x2E);  // prepend dot
-    }
-    out.push(b);
-    lineStart = (b === 0x0A /* '\n' */);
+    if (lineStart && b === 0x2E) extra++;
+    lineStart = (b === 0x0A);
   }
-  // Ensure trailing CRLF before the terminator dot
-  if (out.length >= 2) {
-    let n = out.length;
-    if (!(out[n - 2] === 0x0D && out[n - 1] === 0x0A)) {
-      out.push(0x0D); out.push(0x0A);
-    }
-  } else {
-    out.push(0x0D); out.push(0x0A);
+
+  // Does the content already end with CRLF? If not we must append one before
+  // the terminating "." line the caller adds.
+  let needsCRLF = !(len >= 2 && raw[len - 2] === 0x0D && raw[len - 1] === 0x0A);
+  let tail = needsCRLF ? 2 : 0;
+
+  let out = Buffer.allocUnsafe(len + extra + tail);
+  let w = 0;
+  lineStart = true;
+  for (let i = 0; i < len; i++) {
+    let b = raw[i];
+    if (lineStart && b === 0x2E) out[w++] = 0x2E;   // stuff leading dot
+    out[w++] = b;
+    lineStart = (b === 0x0A);
   }
-  return new Uint8Array(out);
+  if (needsCRLF) { out[w++] = 0x0D; out[w++] = 0x0A; }
+  return out;
 }
 
 // Extract the headers + first `bodyLines` body lines from raw RFC 5322 bytes.
@@ -141,7 +150,25 @@ function POP3Session(options) {
   const ev = new EventEmitter();
   ev.setMaxListeners(50);
 
+  // Missing-handler protection (same rationale as the IMAP session): if a
+  // storage event carries a completion callback and the developer never
+  // registered a listener, invoke the callback with a descriptive error
+  // instead of leaving the POP3 command unanswered forever.
+  function guardedEmit(name) {
+    let args = Array.prototype.slice.call(arguments, 1);
+    let cb = args.length > 0 ? args[args.length - 1] : null;
+    if (typeof cb === 'function' && ev.listenerCount(name) === 0) {
+      cb(new Error("No handler registered for '" + name + "' — add session.on('" + name + "', ...)"));
+      return false;
+    }
+    return ev.emit.apply(ev, [name].concat(args));
+  }
+
   let context = {
+    // Watchdog for developer handlers that never call back (opt-in, ms; 0=off)
+    handlerTimeout: options.handlerTimeout || 0,
+    watchdogTimer: null,
+    watchdogAnswered: false,
     state: STATE.NEW,
     isServer: options.isServer !== false,
 
@@ -192,9 +219,29 @@ function POP3Session(options) {
     if (typeof data === 'string') data = toU8(data);
     ev.emit('send', data);
   }
-  function sendOk(text)   { send('+OK '  + (text || '') + '\r\n'); }
-  function sendErr(text)  { send('-ERR ' + (text || '') + '\r\n'); }
-  function sendLine(text) { send(text + '\r\n'); }
+  function sendOk(text)   { sendLine('+OK '  + (text || '')); }
+  function sendErr(text)  { sendLine('-ERR ' + (text || '')); }
+  function sendLine(text) {
+    // Watchdog: any output means the current command is being answered.
+    if (context.watchdogTimer) { clearTimeout(context.watchdogTimer); context.watchdogTimer = null; }
+    if (context.watchdogAnswered) return;   // watchdog already answered; swallow late reply
+    send(text + '\r\n');
+  }
+
+  // Per-command watchdog (POP3 is strictly one outstanding command at a time).
+  function armWatchdog(cmdName) {
+    context.watchdogAnswered = false;
+    if (!context.handlerTimeout || context.handlerTimeout <= 0) return;
+    if (context.watchdogTimer) clearTimeout(context.watchdogTimer);
+    context.watchdogTimer = setTimeout(function() {
+      context.watchdogTimer = null;
+      send('-ERR ' + cmdName + ' timed out after ' + context.handlerTimeout +
+           'ms - a storage handler did not call its callback\r\n');
+      context.watchdogAnswered = true;
+      ev.emit('handlerTimeout', { command: cmdName, timeout: context.handlerTimeout });
+    }, context.handlerTimeout);
+    if (context.watchdogTimer.unref) context.watchdogTimer.unref();
+  }
   // Multi-line terminator: single dot on its own line.
   function sendEnd()      { send('.\r\n'); }
 
@@ -240,6 +287,7 @@ function POP3Session(options) {
     // Split on first whitespace — everything after is args
     let spaceIdx = trimmed.indexOf(' ');
     let cmd  = (spaceIdx < 0 ? trimmed : trimmed.substring(0, spaceIdx)).toUpperCase();
+    armWatchdog(cmd);
     let argStr = spaceIdx < 0 ? '' : trimmed.substring(spaceIdx + 1);
     let args = argStr.length > 0 ? argStr.split(/\s+/) : [];
 
@@ -488,7 +536,7 @@ function POP3Session(options) {
       cb(new Error('No openFolder handler registered'));
       return;
     }
-    ev.emit('openFolder', 'INBOX', function(err, info) {
+    guardedEmit('openFolder', 'INBOX', function(err, info) {
       if (err) { cb(err); return; }
       info = info || {};
       context.folderInfo = info;
@@ -507,7 +555,7 @@ function POP3Session(options) {
       }
       // Flat half-open range format used elsewhere in this library
       let query = { ranges: [1, Infinity], isUid: false, total: total };
-      ev.emit('resolveMessages', 'INBOX', query, function(err, pairs) {
+      guardedEmit('resolveMessages', 'INBOX', query, function(err, pairs) {
         if (err) { cb(err); return; }
         pairs = pairs || [];
         // Sort by seq to match POP3 ordering semantics
@@ -529,7 +577,7 @@ function POP3Session(options) {
           return;
         }
         let uids = pairs.map(function(p) { return p.uid; });
-        ev.emit('messageMeta', 'INBOX', uids, function(err, metas) {
+        guardedEmit('messageMeta', 'INBOX', uids, function(err, metas) {
           if (err) { cb(err); return; }
           metas = metas || [];
           let metaByUid = {};
@@ -658,6 +706,10 @@ function POP3Session(options) {
         sendErr(msg || 'Retrieve failed');
       }
     };
+    if (ev.listenerCount('messageBody') === 0) {
+      sendLine("-ERR no 'messageBody' handler registered on the server");
+      return;
+    }
     ev.emit('messageBody', 'INBOX', m.uid, responder);
   }
 
@@ -693,6 +745,10 @@ function POP3Session(options) {
         sendErr(msg || 'Retrieve failed');
       }
     };
+    if (ev.listenerCount('messageBody') === 0) {
+      sendLine("-ERR no 'messageBody' handler registered on the server");
+      return;
+    }
     ev.emit('messageBody', 'INBOX', m.uid, responder);
   }
 
@@ -765,7 +821,7 @@ function POP3Session(options) {
       if (!waitExp) { done(); return; }
       // Match the IMAP expunge event shape: (folder, opts, cb)
       let query = { ranges: [], uids: uids.slice() };
-      ev.emit('expunge', 'INBOX', { uids: uids.slice() }, function(err) {
+      guardedEmit('expunge', 'INBOX', { uids: uids.slice() }, function(err) {
         // We don't surface errors to the client at this point (QUIT has succeeded
         // up to this call). Emit an internal 'error' for developer logging.
         if (err) ev.emit('error', err);
@@ -783,7 +839,7 @@ function POP3Session(options) {
       mode:  'add',
       silent: true
     };
-    ev.emit('setFlags', 'INBOX', query, function(err) {
+    guardedEmit('setFlags', 'INBOX', query, function(err) {
       if (err) ev.emit('error', err);
       doExpunge();
     });

@@ -219,15 +219,82 @@ function ipv4ToNum(ip) {
           (parseInt(parts[2]) << 8) | parseInt(parts[3])) >>> 0;
 }
 
+// Expand an IPv6 address string into a 16-byte Uint8Array.
+// Handles '::' compression, mixed IPv4-mapped tails ('::ffff:1.2.3.4'),
+// and leading-zero-omitted groups. Returns null on invalid input.
+function ipv6ToBytes(addr) {
+  let s = String(addr || '').toLowerCase();
+  if (!net.isIPv6(s)) return null;
+
+  // Split off an embedded IPv4 tail if present ("...:1.2.3.4")
+  let v4Tail = null;
+  let lastColon = s.lastIndexOf(':');
+  if (s.indexOf('.') > lastColon) {
+    v4Tail = s.slice(lastColon + 1);
+    s = s.slice(0, lastColon) + ':0:0';   // placeholder — replaced below
+  }
+
+  let halves = s.split('::');
+  let head = halves[0] ? halves[0].split(':').filter(Boolean) : [];
+  let tail = halves.length > 1 && halves[1] ? halves[1].split(':').filter(Boolean) : [];
+  let groups;
+  if (halves.length > 1) {
+    let missing = 8 - head.length - tail.length;
+    if (missing < 0) return null;
+    groups = head.concat(new Array(missing).fill('0'), tail);
+  } else {
+    groups = head;
+  }
+  if (groups.length !== 8) return null;
+
+  let bytes = new Uint8Array(16);
+  for (let i = 0; i < 8; i++) {
+    let v = parseInt(groups[i], 16);
+    if (isNaN(v) || v < 0 || v > 0xFFFF) return null;
+    bytes[i * 2]     = (v >> 8) & 0xFF;
+    bytes[i * 2 + 1] = v & 0xFF;
+  }
+
+  // Write the IPv4 tail into the last 4 bytes if there was one
+  if (v4Tail) {
+    let p = v4Tail.split('.');
+    if (p.length !== 4) return null;
+    for (let i = 0; i < 4; i++) {
+      let n = parseInt(p[i], 10);
+      if (isNaN(n) || n < 0 || n > 255) return null;
+      bytes[12 + i] = n;
+    }
+  }
+  return bytes;
+}
+
+// Compare the first `bits` bits of two 16-byte addresses.
+function ipv6PrefixEqual(a, b, bits) {
+  if (bits > 128) bits = 128;
+  let fullBytes = bits >> 3;
+  for (let i = 0; i < fullBytes; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  let remBits = bits & 7;
+  if (remBits === 0) return true;
+  let mask = (0xFF << (8 - remBits)) & 0xFF;
+  return (a[fullBytes] & mask) === (b[fullBytes] & mask);
+}
+
 function matchIPv6(ip, cidr) {
-  // Basic IPv6 CIDR match — simplified
   let normIP = normalizeIP(ip);
   if (net.isIPv4(normIP)) return false;
 
   let parts = cidr.split('/');
   let addr = parts[0];
-  // Simple exact match for now (full CIDR would need more complex bit ops)
-  return normalizeIP(addr) === normIP;
+  let prefixLen = parts[1] !== undefined ? parseInt(parts[1], 10) : 128;
+  if (isNaN(prefixLen) || prefixLen < 0 || prefixLen > 128) return false;
+
+  let ipBytes = ipv6ToBytes(normIP);
+  let netBytes = ipv6ToBytes(addr);
+  if (!ipBytes || !netBytes) return false;
+
+  return ipv6PrefixEqual(ipBytes, netBytes, prefixLen);
 }
 
 function qualifierToResult(q) {

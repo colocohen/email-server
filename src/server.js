@@ -10,8 +10,8 @@ import { IMAPSession } from './imap_session.js';
 import { POP3Session } from './pop3_session.js';
 import { sendMail } from './smtp_client.js';
 import { OutboundPool } from './pool.js';
-import { createRateLimiter } from './rate_limit.js';
 import { buildDsn } from './dsn.js';
+import { prependReceived, countReceivedHops } from './received.js';
 import { composeMessage, parseMessage as parseMessageFn } from './message.js';
 import { sign as dkimSign, verify as dkimVerify } from './dkim.js';
 import { checkSPF } from './spf.js';
@@ -37,8 +37,21 @@ function Server(options) {
     maxSize: options.maxSize || 25 * 1024 * 1024,
     maxRecipients: options.maxRecipients || 100,
     acceptTimeout: options.acceptTimeout || 30000,
-    rateLimit: options.rateLimit || null,
     closeTimeout: options.closeTimeout || 30000,
+
+    // Trace headers + loop detection (RFC 5321 §4.4 / §6.3).
+    //  addReceived:     prepend a Received: header to every inbound message
+    //                   (default true — a conforming MTA always does this).
+    //  maxReceivedHops: refuse a message that already carries this many
+    //                   Received: headers, indicating a routing loop
+    //                   (default 100, the long-standing convention). 0 disables.
+    addReceived:     options.addReceived !== false,
+    maxReceivedHops: options.maxReceivedHops != null ? options.maxReceivedHops : 100,
+
+    // Handler watchdog + APPEND size ceiling — passed through to sessions.
+    handlerTimeout:  options.handlerTimeout  || 0,      // 0 = off (opt-in)
+    maxAppendSize:   options.maxAppendSize   || 0,      // 0 = no APPENDLIMIT
+    metadataMaxSize: options.metadataMaxSize || 0,
 
     // PROXY protocol (HAProxy)
     useProxy: options.useProxy || false,
@@ -63,6 +76,14 @@ function Server(options) {
     // Active connections (socket → { id, session })
     connections: new Map(),
 
+    // Active IMAP/POP3 mailbox-session facades. Registered when the
+    // mailboxSession event fires, removed on the session's 'close'. Lets the
+    // developer fan a notification out to every live session for a given user
+    // via server.forEachMailboxSession(fn) without maintaining their own
+    // registry. The library does NOT know which sessions belong to which user
+    // (that's the developer's storage concern) — it just tracks liveness.
+    mailboxSessions: new Set(),
+
     // Connection counter for IDs
     connectionCounter: 0,
 
@@ -72,13 +93,12 @@ function Server(options) {
     // Outbound pool
     pool: null,
 
-    // Per-IP rate limiter (opt-in via options.rateLimit).
-    // When `rateLimit` is null, `limiter` is null and all checks are skipped.
+    // Rate limiting is intentionally NOT wired up in this version — it needs
+    // a dedicated design pass (per-IP vs per-user, distributed state, etc.).
+    // `limiter` stays null; every `if (context.limiter)` guard below is a
+    // deliberate no-op until that work lands. Do not re-add without that design.
     limiter: null
   };
-
-  // Create the rate limiter if configured
-  if (options.rateLimit) context.limiter = createRateLimiter(options.rateLimit);
 
   // Create outbound pool
   let poolOpts = options.pool || {};
@@ -293,6 +313,92 @@ function Server(options) {
     // Message event — fire 'mail' on the session facade after any required
     // auth checks (SPF/DKIM/DMARC/rDNS for port 25).
     session.on('message', function(mail) {
+      // Attach mail.deliver(cb) — the README-documented one-liner that signs
+      // (DKIM) and relays/queues the message through the outbound pool. Works
+      // in both submission and inbound contexts (a common pattern is inbound
+      // forwarding). It re-derives the envelope from the SMTP transaction so
+      // the developer doesn't have to restate from/to. On success it also
+      // sends the 250 to the client (unless the developer already responded).
+      mail.deliver = function(deliverCb) {
+        let envFrom = mail.from;
+        let envTo = (mail.to || []).slice();
+        if (!envFrom || envTo.length === 0) {
+          let e = new Error('deliver(): missing envelope from/to');
+          if (deliverCb) deliverCb(e);
+          return;
+        }
+        // Group recipients by domain and enqueue via the pool (raw already
+        // composed — it's the received message bytes). DKIM signing on
+        // forward is the developer's call; we relay as-is here.
+        let byDomain = {};
+        for (let i = 0; i < envTo.length; i++) {
+          let at = envTo[i].lastIndexOf('@');
+          if (at < 0) continue;
+          let d = envTo[i].substring(at + 1);
+          (byDomain[d] = byDomain[d] || []).push(envTo[i]);
+        }
+        let domains = Object.keys(byDomain);
+        if (domains.length === 0) {
+          let e = new Error('deliver(): no valid recipients');
+          if (deliverCb) deliverCb(e);
+          return;
+        }
+        let pending = domains.length, results = [], errors = [];
+        for (let i = 0; i < domains.length; i++) {
+          context.pool.enqueue({
+            envFrom: envFrom,
+            envTo: byDomain[domains[i]],
+            raw: mail.raw,
+            messageId: mail.messageId,
+            cb: function(err, info) {
+              if (err) errors.push(err); else results.push(info);
+              if (--pending === 0) {
+                if (errors.length > 0 && results.length === 0) {
+                  if (deliverCb) deliverCb(errors[0]);
+                } else {
+                  // Acknowledge to the origin client if not already answered.
+                  if (!mail._accepted && !mail._rejected) mail.accept();
+                  if (deliverCb) deliverCb(null, { accepted: results, rejected: errors });
+                }
+              }
+            }
+          });
+        }
+      };
+
+      // --- Loop detection (RFC 5321 §6.3) ---
+      // Count the Received: hops already on the message. Beyond the ceiling we
+      // refuse — an unbroken relay loop grows this without bound. Checked for
+      // both inbound and submission (a misconfigured client can loop too).
+      if (context.maxReceivedHops > 0) {
+        let hops = countReceivedHops(mail.raw);
+        if (hops >= context.maxReceivedHops) {
+          ev.emit('loop', { remoteAddress: remoteAddress, hops: hops, from: mail.from, to: mail.to });
+          mail.reject(554, 'Too many hops (' + hops + ') — mail loop detected');
+          return;
+        }
+      }
+
+      // --- Received: trace header (RFC 5321 §4.4) ---
+      // Prepend our Received line to the raw bytes so downstream storage and
+      // any forwarding carries an accurate delivery trace. Done before auth
+      // checks so DKIM verification still sees the original body (DKIM's
+      // canonicalization does not cover Received). We rewrite mail.raw/size
+      // in place; the developer sees the stamped message.
+      if (context.addReceived) {
+        let onlyRcpt = (mail.to && mail.to.length === 1) ? mail.to[0] : null;
+        mail.raw = prependReceived(mail.raw, {
+          from:          session.clientHostname || null,
+          fromIp:        remoteAddress,
+          by:            context.hostname,
+          tls:           session.isTLS,
+          authenticated: isSubmission,
+          id:            connId,
+          forRecipient:  onlyRcpt
+        });
+        mail.size = mail.raw.length;
+      }
+
       if (isSubmission) {
         sessionFacade.emit('mail', mail);
         // After developer registers mail.on('data') / mail.on('end'), trigger body events
@@ -611,7 +717,10 @@ function Server(options) {
       localAddress:  socket.localAddress || null,
       isTLS:         socket.encrypted || false,
       tlsOptions:    hasTls ? {} : null,
-      authTimeout:   context.acceptTimeout
+      authTimeout:   context.acceptTimeout,
+      handlerTimeout: context.handlerTimeout,
+      maxAppendSize:  context.maxAppendSize,
+      metadataMaxSize: context.metadataMaxSize
     });
 
     // Wire session output → socket (with backpressure). The sendFn indirection
@@ -689,6 +798,8 @@ function Server(options) {
             get idling()        { return imapSession.idling; }
           };
 
+          context.mailboxSessions.add(sessionFacade);
+          imapSession.on('close', function() { context.mailboxSessions.delete(sessionFacade); });
           ev.emit('mailboxSession', sessionFacade);
         },
 
@@ -814,7 +925,8 @@ function Server(options) {
       hostname:      context.hostname,
       remoteAddress: remoteAddress,
       isTLS:         socket.encrypted || false,
-      tlsOptions:    hasTls ? {} : null
+      tlsOptions:    hasTls ? {} : null,
+      handlerTimeout: context.handlerTimeout
     });
 
     // Wire session output → socket (with backpressure)
@@ -869,6 +981,8 @@ function Server(options) {
             get currentFolder() { return pop3Session.authenticated ? 'INBOX' : null; },
             get idling()        { return false; }   // POP3 has no IDLE
           };
+          context.mailboxSessions.add(sessionFacade);
+          pop3Session.on('close', function() { context.mailboxSessions.delete(sessionFacade); });
           ev.emit('mailboxSession', sessionFacade);
           authCtx.accept();
         },
@@ -1032,15 +1146,32 @@ function Server(options) {
       return;
     }
 
-    // Stop accepting new connections
+    let drainTimer = null;
+    let closeTimer = null;
+
+    function finish() {
+      if (drainTimer) { clearInterval(drainTimer); drainTimer = null; }
+      if (closeTimer) { clearTimeout(closeTimer);  closeTimer  = null; }
+      context.servers = [];
+      context.listening = false;
+      if (cb) { let fn = cb; cb = null; fn(); }
+    }
+
+    // Stop accepting new connections. When the last listener has closed,
+    // either finish immediately (no live connections) or start polling for
+    // connection drain — sockets may close AFTER the listeners do, and
+    // nothing else re-runs this check (socket 'close' handlers only delete
+    // from the map; they don't know a shutdown is in progress).
     for (let i = 0; i < context.servers.length; i++) {
       context.servers[i].close(function() {
         pending--;
-        if (pending === 0 && context.connections.size === 0) {
-          context.servers = [];
-          context.listening = false;
-          if (cb) { let fn = cb; cb = null; fn(); }
-        }
+        if (pending !== 0) return;
+        if (context.connections.size === 0) return finish();
+        drainTimer = setInterval(function() {
+          if (context.connections.size === 0) finish();
+        }, 100);
+        // Intentionally NOT unref'd: close(cb) is an explicit request and the
+        // caller is owed the callback. The force timer below bounds the wait.
       });
     }
 
@@ -1051,18 +1182,14 @@ function Server(options) {
       } catch(e) {}
     });
 
-    // Force close after timeout
-    let closeTimer = setTimeout(function() {
+    // Force close after timeout — the upper bound on the graceful window.
+    closeTimer = setTimeout(function() {
       context.connections.forEach(function(info, socket) {
         try { socket.destroy(); } catch(e) {}
       });
       context.connections.clear();
-      context.servers = [];
-      context.listening = false;
-      if (cb) { let fn = cb; cb = null; fn(); }
+      finish();
     }, context.closeTimeout);
-
-    if (closeTimer.unref) closeTimer.unref();
   }
 
 
@@ -1108,19 +1235,45 @@ function Server(options) {
 
         let byDomain = {};
         for (let i = 0; i < envTo.length; i++) {
-          let domain = envTo[i].split('@')[1] || '';
+          let at = envTo[i].lastIndexOf('@');
+          if (at < 0) continue;                    // skip malformed address
+          let domain = envTo[i].substring(at + 1);
           if (!byDomain[domain]) byDomain[domain] = [];
           byDomain[domain].push(envTo[i]);
         }
 
         let domains = Object.keys(byDomain);
+        if (domains.length === 0) {
+          let e = new Error('No valid recipients');
+          ev.emit('sendError', e, options);
+          if (cb) cb(e);
+          return;
+        }
+
+        // Fan-in: aggregate per-domain results so the caller sees the
+        // outcome of EVERY queue, not just the last one. Mirrors the
+        // accepted/rejected shape of sendMail().
+        let pendingDomains = domains.length;
+        let results = [], errors = [];
+
+        function oneDomainDone(domain) {
+          return function(err, info) {
+            if (err) errors.push({ domain: domain, error: err });
+            else results.push(info);
+            if (--pendingDomains === 0 && cb) {
+              if (errors.length > 0 && results.length === 0) cb(errors[0].error);
+              else cb(null, { messageId: messageId, accepted: results, rejected: errors });
+            }
+          };
+        }
+
         for (let i = 0; i < domains.length; i++) {
           context.pool.enqueue({
             envFrom: envFrom,
             envTo: byDomain[domains[i]],
             raw: raw,
             messageId: messageId,
-            cb: (i === domains.length - 1) ? cb : null
+            cb: oneDomainDone(domains[i])
           });
         }
       });
@@ -1208,6 +1361,32 @@ function Server(options) {
     listen: listen,
     close: close,
     send: send,
+
+    // Outbound-queue persistence (bring-your-own-storage for the queue):
+    // snapshot the pending outbound messages and re-ingest them on startup,
+    // so a crash/restart doesn't lose queued or retry-pending mail.
+    //   fs.writeFileSync('q.json', JSON.stringify(server.serializeQueue()));
+    //   server.restoreQueue(JSON.parse(fs.readFileSync('q.json', 'utf-8')));
+    // Restored messages report via the 'sent' / 'bounce' / 'retry' events.
+    serializeQueue: function() { return context.pool.serialize(); },
+    restoreQueue: function(snapshot) { return context.pool.restore(snapshot); },
+
+    // Iterate every live IMAP/POP3 mailbox session. The developer uses this
+    // to fan a change out to all connected sessions for a user — e.g. when a
+    // new message lands, walk the sessions, match the ones whose username +
+    // currentFolder are affected, and call notifyExists() on them. The library
+    // deliberately does not maintain a user→sessions index (multi-tenant
+    // identity is the developer's concern), but it does track liveness so you
+    // don't have to wire your own add/remove on the mailboxSession/close events.
+    //
+    //   server.forEachMailboxSession(s => {
+    //     if (s.username === user && s.currentFolder === 'INBOX') s.notifyExists(n);
+    //   });
+    forEachMailboxSession: function(fn) {
+      context.mailboxSessions.forEach(function(s) {
+        try { fn(s); } catch (e) { ev.emit('error', e); }
+      });
+    },
 
     // Internal — exposed for advanced use
     resolveDkim: resolveDkim,

@@ -83,6 +83,10 @@ function OutboundPool(options) {
         domain: domain,
         connections: [],       // { conn, busy, messageCount, idleTimer, alive }
         pending: [],           // { message, cb, attempts, nextRetry, id }
+        inFlight: [],          // entries currently being transmitted — tracked
+                               // so serialize() can snapshot them too (a crash
+                               // mid-send must not lose the message; restore
+                               // re-sends it: at-least-once, like every MTA)
         stats: {
           lastConnectTime: 0,
           lastDisconnectTime: 0,
@@ -307,6 +311,11 @@ function OutboundPool(options) {
   // ============================================================
 
   function finishMessage(pool, entry, msg, err, info) {
+    // The message's fate is decided here in all three cases (retry re-queues
+    // it, bounce drops it, success completes it) — leave the in-flight list
+    // first so serialize() never double-counts it.
+    doneInFlight(pool, msg);
+
     if (err) {
       // Is it retryable?
       let retryable = !err.permanent && msg.attempts < settings.retryDelays.length;
@@ -404,10 +413,19 @@ function OutboundPool(options) {
     let now = Date.now();
     for (let i = 0; i < pool.pending.length; i++) {
       if (pool.pending[i].nextRetry <= now) {
-        return pool.pending.splice(i, 1)[0];
+        let entry = pool.pending.splice(i, 1)[0];
+        pool.inFlight.push(entry);
+        return entry;
       }
     }
     return null;
+  }
+
+  // Remove an entry from the in-flight list once its fate is decided
+  // (delivered, re-queued for retry, or bounced).
+  function doneInFlight(pool, entry) {
+    let i = pool.inFlight.indexOf(entry);
+    if (i >= 0) pool.inFlight.splice(i, 1);
   }
 
 
@@ -506,7 +524,32 @@ function OutboundPool(options) {
 
   function enqueue(msg) {
     // msg: { envFrom, envTo: [], raw, messageId, cb }
-    let domain = msg.envTo[0].split('@')[1] || '';
+    //
+    // CONTRACT: all recipients in one enqueue() call MUST share a domain —
+    // the pool routes the whole message through that domain's MX. Callers
+    // that have mixed-domain recipient lists must group first (server.send
+    // and sendMail both do). We validate rather than silently misroute.
+    if (!msg || !Array.isArray(msg.envTo) || msg.envTo.length === 0) {
+      let e = new Error('enqueue requires a non-empty envTo array');
+      if (msg && msg.cb) { msg.cb(e); return -1; }
+      throw e;
+    }
+    let at = msg.envTo[0].lastIndexOf('@');
+    if (at < 0) {
+      let e = new Error('Invalid recipient (no @): ' + msg.envTo[0]);
+      if (msg.cb) { msg.cb(e); return -1; }
+      throw e;
+    }
+    let domain = msg.envTo[0].substring(at + 1);
+    for (let i = 1; i < msg.envTo.length; i++) {
+      let at2 = msg.envTo[i].lastIndexOf('@');
+      if (at2 < 0 || msg.envTo[i].substring(at2 + 1).toLowerCase() !== domain.toLowerCase()) {
+        let e = new Error('enqueue requires all recipients in the same domain; ' +
+          'got "' + msg.envTo[i] + '" alongside "@' + domain + '". Group by domain first.');
+        if (msg.cb) { msg.cb(e); return -1; }
+        throw e;
+      }
+    }
     let pool = getPool(domain);
 
     let entry = {
@@ -531,6 +574,80 @@ function OutboundPool(options) {
     return entry.id;
   }
 
+
+  // ============================================================
+  //  Public API: queue persistence hooks
+  // ============================================================
+  //
+  //  The pool queue lives in memory: a process crash loses every message
+  //  still pending or waiting on a retry backoff. In keeping with the
+  //  library's bring-your-own-storage philosophy, we don't write to disk —
+  //  we hand YOU a snapshot and accept it back:
+  //
+  //    // periodically, or on 'queueChanged', or on SIGTERM:
+  //    fs.writeFileSync('queue.json', JSON.stringify(pool.serialize()));
+  //
+  //    // on startup:
+  //    if (fs.existsSync('queue.json')) {
+  //      pool.restore(JSON.parse(fs.readFileSync('queue.json', 'utf-8')));
+  //    }
+  //
+  //  Callbacks are NOT serializable, so restored messages report their fate
+  //  through the pool's 'sent' / 'bounce' / 'retry' events instead of a cb.
+  //  The snapshot carries raw bytes base64-encoded so it survives JSON.
+
+  function serialize() {
+    let out = { version: 1, savedAt: Date.now(), messages: [] };
+    let domains = Object.keys(pools);
+    for (let d = 0; d < domains.length; d++) {
+      // Snapshot BOTH queued and in-flight entries: a message being
+      // transmitted at crash time must survive the restart (it will be
+      // re-sent — at-least-once delivery, the standard MTA trade-off).
+      let all = pools[domains[d]].pending.concat(pools[domains[d]].inFlight);
+      for (let i = 0; i < all.length; i++) {
+        let e = all[i];
+        out.messages.push({
+          id: e.id,
+          envFrom: e.envFrom,
+          envTo: e.envTo,
+          raw: Buffer.from(e.raw).toString('base64'),
+          messageId: e.messageId,
+          attempts: e.attempts,
+          nextRetry: e.nextRetry
+        });
+      }
+    }
+    return out;
+  }
+
+  function restore(snapshot) {
+    if (!snapshot || !Array.isArray(snapshot.messages)) return 0;
+    let restored = 0;
+    for (let i = 0; i < snapshot.messages.length; i++) {
+      let m = snapshot.messages[i];
+      if (!m || !Array.isArray(m.envTo) || m.envTo.length === 0 || !m.raw) continue;
+      let id = enqueue({
+        envFrom: m.envFrom,
+        envTo: m.envTo,
+        raw: Buffer.from(m.raw, 'base64'),
+        messageId: m.messageId || null,
+        cb: null                       // fate reported via 'sent'/'bounce' events
+      });
+      if (id !== -1) {
+        // Preserve retry history so a restored message doesn't restart its
+        // backoff ladder from zero.
+        let at = m.envTo[0].lastIndexOf('@');
+        let pool = pools[m.envTo[0].substring(at + 1)];
+        if (pool && pool.pending.length > 0) {
+          let entry = pool.pending[pool.pending.length - 1];
+          if (typeof m.attempts === 'number') entry.attempts = m.attempts;
+          if (typeof m.nextRetry === 'number') entry.nextRetry = m.nextRetry;
+        }
+        restored++;
+      }
+    }
+    return restored;
+  }
 
   // ============================================================
   //  Public API: close all
@@ -588,6 +705,8 @@ function OutboundPool(options) {
 
   let api = {
     enqueue: enqueue,
+    serialize: serialize,
+    restore: restore,
     closeAll: closeAll,
     getStats: getStats,
     startScheduler: startScheduler,

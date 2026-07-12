@@ -47,9 +47,12 @@ export function registerMetadataHandlers(s) {
   const sendTagged        = s.sendTagged;
   const sendUntagged      = s.sendUntagged;
   const getStringValue    = s.getStringValue;
+  const getMailboxName    = s.getMailboxName;
 
-  // Per-session config — bumped later if developer sets server.metadataMaxSize
-  const maxSize = DEFAULT_MAXSIZE;
+  // Per-session config — developer sets it via IMAPSession options:
+  //   new IMAPSession({ metadataMaxSize: 65536 })
+  // Falls back to the Dovecot-compatible 2 KB default.
+  const maxSize = (s.context && s.context.metadataMaxSize) || DEFAULT_MAXSIZE;
 
 
   // --- GETMETADATA ---
@@ -173,7 +176,7 @@ export function registerMetadataHandlers(s) {
       sendTagged(tag, 'BAD', 'SETMETADATA requires mailbox and entry list');
       return;
     }
-    let mailbox = getStringValue(args[0]);
+    let mailbox = getMailboxName(args[0]);
     let entryTok = args[1];
     if (!entryTok || entryTok.type !== TOK.LIST) {
       sendTagged(tag, 'BAD', 'SETMETADATA requires entry-value list');

@@ -69,6 +69,7 @@ export function registerMessageHandlers(s) {
   const send           = s.send;
   const requireSelected = s.requireSelected;
   const getStringValue = s.getStringValue;
+  const getMailboxName = s.getMailboxName;
 
   // Parse parenthesized fetch/store modifiers like "(CHANGEDSINCE 12345)" or
   // "(UNCHANGEDSINCE 42)" or "(CHANGEDSINCE 42 VANISHED)". Returns an object
@@ -263,6 +264,35 @@ export function registerMessageHandlers(s) {
 
   // Fetch a set of messages and emit responses.
   function fetchMessages(tag, messages, items, byUid) {
+    // --- Implicit \Seen (RFC 3501 §6.4.5) ---
+    // Fetching BODY[...] (without .PEEK), RFC822, or RFC822.TEXT implicitly
+    // sets \Seen on the fetched messages. The library owns no flag storage,
+    // so we surface this as a normal setFlags event (mode:'add', silent:true,
+    // implicit:true) that the developer's existing STORE handler persists.
+    // Skipped when the mailbox is read-only (EXAMINE) per the RFC, and when
+    // no setFlags listener exists (nothing could persist it anyway).
+    let setsSeen = false;
+    for (let i = 0; i < items.length; i++) {
+      let n = items[i].name;
+      if (n === 'RFC822' || n === 'RFC822.TEXT') { setsSeen = true; break; }
+      if (n === 'BODY' && items[i].section !== undefined && !items[i].peek) { setsSeen = true; break; }
+    }
+    if (setsSeen && !context.currentFolderReadOnly && ev.listenerCount('setFlags') > 0) {
+      let seenUids = [];
+      for (let i = 0; i < messages.length; i++) {
+        if (messages[i] && messages[i].uid != null) seenUids.push(messages[i].uid);
+      }
+      if (seenUids.length > 0) {
+        ev.emit('setFlags', context.currentFolder, {
+          uids: seenUids,
+          flags: ['Seen'],
+          mode: 'add',
+          silent: true,      // no untagged FETCH needed — client knows the rule
+          implicit: true     // lets the developer distinguish from explicit STORE
+        }, function() { /* best-effort — fetch proceeds regardless */ });
+      }
+    }
+
     // Detect which optional batched-cache events are registered. If so,
     // ENVELOPE / BODYSTRUCTURE can be served from the developer's cache
     // without reading each message body — huge win for folder-open flows.
@@ -444,6 +474,15 @@ export function registerMessageHandlers(s) {
           }
         );
 
+        // Same missing-handler protection as guardedEmit, adapted for the
+        // responder pattern: with no messageBody listener the responder would
+        // never fire and the FETCH would hang mid-batch. Fail the batch with
+        // a clear tagged NO instead.
+        if (ev.listenerCount('messageBody') === 0) {
+          sendTagged(tag, 'NO',
+            "No handler registered for 'messageBody' — add session.on('messageBody', ...) to serve message content");
+          return;
+        }
         ev.emit('messageBody', context.currentFolder, capturedMsg.uid, responder);
         return;
       }
@@ -986,7 +1025,7 @@ export function registerMessageHandlers(s) {
       return;
     }
     let setStr = getStringValue(args[0]);
-    let dst = getStringValue(args[1]);
+    let dst = getMailboxName(args[1]);
 
     let parsed = parseSequenceSet(setStr, { isUid: byUid, total: context.currentFolderTotal });
     if (parsed.error) {
@@ -1009,7 +1048,8 @@ export function registerMessageHandlers(s) {
         let uids = messages.map(function(m) { return m.uid; });
         ev.emit('copyMessages', context.currentFolder, uids, dst, function(err, mapping) {
           if (err) {
-            sendTagged(tag, 'NO', err.message || 'Cannot copy messages');
+            let tcCode = (err.tryCreate || err.code === 'TRYCREATE') ? 'TRYCREATE' : null;
+          sendTagged(tag, 'NO', err.message || 'Cannot copy messages', tcCode);
             return;
           }
           // RFC 4315 COPYUID: developer returns either

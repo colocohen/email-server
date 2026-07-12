@@ -197,9 +197,158 @@ function extractHeaders(raw) {
 // which 5322 recommends be replaced with "+0000" for strict compatibility.
 function formatDate(d) {
   if (!(d instanceof Date)) d = new Date(d);
+  // Guard: an unparseable input would otherwise emit the literal string
+  // "Invalid Date" into an RFC 5322 header. Fall back to now.
+  if (isNaN(d.getTime())) d = new Date();
   // Date.toUTCString → "Wed, 22 Apr 2026 15:00:00 GMT"
   return d.toUTCString().replace(/\bGMT\b/, '+0000');
 }
 
 
-export { buildDsn };
+// ============================================================
+//  parseDsn — parse an INCOMING delivery status notification
+// ============================================================
+//
+//  The mirror of buildDsn: takes the raw bytes of a received message and, if
+//  it is an RFC 3464 multipart/report (report-type=delivery-status), returns
+//  structured bounce data the developer can act on — which recipient failed,
+//  whether the failure is permanent, and the remote server's diagnostic.
+//
+//    const dsn = parseDsn(mail.raw);
+//    if (dsn) {
+//      for (const r of dsn.recipients) {
+//        if (r.permanent) markAddressAsBad(r.finalRecipient, r.diagnosticCode);
+//      }
+//    }
+//
+//  Returns null when the message is not a DSN. Result shape:
+//    {
+//      reportingMta:   'mx.remote.com'   | null,
+//      arrivalDate:    'Wed, 22 ...'     | null,   (raw header string)
+//      originalEnvelopeId: '...'          | null,
+//      humanReadable:  'the text/plain part'  | '',
+//      recipients: [{
+//        finalRecipient:    'user@host',
+//        originalRecipient: 'user@host' | null,
+//        action:            'failed' | 'delayed' | 'delivered' | 'relayed' | 'expanded',
+//        status:            '5.1.1',
+//        permanent:         true,          // status class 5 = hard bounce
+//        diagnosticCode:    '550 5.1.1 No such user' | null,
+//        remoteMta:         'mx.dest.com' | null,
+//        willRetryUntil:    '...'          | null
+//      }],
+//      originalMessageHeaders: 'From: ...\r\n...'  | null,
+//      originalMessage:        Buffer               | null   (full message/rfc822 part if included)
+//    }
+function parseDsn(raw) {
+  let buf = Buffer.isBuffer(raw) ? raw :
+            (raw instanceof Uint8Array ? Buffer.from(raw) : Buffer.from(String(raw), 'utf-8'));
+  let s = buf.toString('utf-8');
+
+  // --- Top-level headers ---
+  let headEnd = s.indexOf('\r\n\r\n');
+  if (headEnd < 0) return null;
+  let head = s.slice(0, headEnd);
+  let ctMatch = /^Content-Type:\s*([^\r\n]+(?:\r\n[ \t][^\r\n]+)*)/im.exec(head);
+  if (!ctMatch) return null;
+  let ctValue = ctMatch[1].replace(/\r\n[ \t]+/g, ' ');
+  if (!/multipart\/report/i.test(ctValue)) return null;
+  if (!/report-type\s*=\s*"?delivery-status"?/i.test(ctValue)) return null;
+
+  let bMatch = /boundary\s*=\s*(?:"([^"]+)"|([^;\s]+))/i.exec(ctValue);
+  if (!bMatch) return null;
+  let boundary = bMatch[1] || bMatch[2];
+
+  // --- Split parts on the boundary ---
+  let body = s.slice(headEnd + 4);
+  let marker = '--' + boundary;
+  let chunks = body.split(marker);
+  // chunks[0] = preamble; last chunk after "--" terminator = epilogue
+  let parts = [];
+  for (let i = 1; i < chunks.length; i++) {
+    let c = chunks[i];
+    if (c.slice(0, 2) === '--') break;              // reached the closing boundary
+    c = c.replace(/^\r\n/, '');
+    let pHeadEnd = c.indexOf('\r\n\r\n');
+    if (pHeadEnd < 0) continue;
+    let pHead = c.slice(0, pHeadEnd).replace(/\r\n[ \t]+/g, ' ');
+    let pBody = c.slice(pHeadEnd + 4).replace(/\r\n$/, '');
+    let pCt = /^Content-Type:\s*([^\r\n]+)/im.exec(pHead);
+    parts.push({ contentType: pCt ? pCt[1].toLowerCase() : 'text/plain', body: pBody });
+  }
+
+  let out = {
+    reportingMta: null,
+    arrivalDate: null,
+    originalEnvelopeId: null,
+    humanReadable: '',
+    recipients: [],
+    originalMessageHeaders: null,
+    originalMessage: null
+  };
+
+  for (let i = 0; i < parts.length; i++) {
+    let p = parts[i];
+
+    if (p.contentType.indexOf('message/delivery-status') === 0) {
+      // Field groups separated by blank lines; group 0 = per-message,
+      // groups 1..N = one per recipient.
+      let groups = p.body.split(/\r\n\r\n+/);
+      let msgFields = parseDsnFields(groups[0] || '');
+      if (msgFields['reporting-mta']) {
+        out.reportingMta = msgFields['reporting-mta'].replace(/^[^;]*;\s*/, '');
+      }
+      out.arrivalDate = msgFields['arrival-date'] || null;
+      out.originalEnvelopeId = msgFields['original-envelope-id'] || null;
+
+      for (let g = 1; g < groups.length; g++) {
+        if (!groups[g].trim()) continue;
+        let f = parseDsnFields(groups[g]);
+        if (!f['final-recipient'] && !f['action']) continue;
+        let status = f['status'] || '';
+        out.recipients.push({
+          finalRecipient:    f['final-recipient'] ? f['final-recipient'].replace(/^[^;]*;\s*/, '') : null,
+          originalRecipient: f['original-recipient'] ? f['original-recipient'].replace(/^[^;]*;\s*/, '') : null,
+          action:            (f['action'] || '').toLowerCase() || null,
+          status:            status || null,
+          permanent:         status.charAt(0) === '5',
+          diagnosticCode:    f['diagnostic-code'] ? f['diagnostic-code'].replace(/^[^;]*;\s*/, '') : null,
+          remoteMta:         f['remote-mta'] ? f['remote-mta'].replace(/^[^;]*;\s*/, '') : null,
+          willRetryUntil:    f['will-retry-until'] || null
+        });
+      }
+      continue;
+    }
+
+    if (p.contentType.indexOf('message/rfc822') === 0) {
+      out.originalMessage = Buffer.from(p.body, 'utf-8');
+      let ohEnd = p.body.indexOf('\r\n\r\n');
+      out.originalMessageHeaders = ohEnd >= 0 ? p.body.slice(0, ohEnd) : p.body;
+      continue;
+    }
+
+    if (p.contentType.indexOf('text/rfc822-headers') === 0) {
+      out.originalMessageHeaders = p.body;
+      continue;
+    }
+
+    if (p.contentType.indexOf('text/plain') === 0 && !out.humanReadable) {
+      out.humanReadable = p.body;
+    }
+  }
+
+  return out;
+}
+
+// Parse "Field: value" lines (with folding) into a lowercase-keyed object.
+function parseDsnFields(block) {
+  let out = {};
+  let lines = block.replace(/\r\n[ \t]+/g, ' ').split('\r\n');
+  for (let i = 0; i < lines.length; i++) {
+    let m = /^([^:]+):\s*(.*)$/.exec(lines[i]);
+    if (m) out[m[1].trim().toLowerCase()] = m[2].trim();
+  }
+  return out;
+}
+
+export { buildDsn, parseDsn };

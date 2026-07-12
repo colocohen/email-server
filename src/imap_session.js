@@ -37,6 +37,8 @@ import { registerMetadataHandlers } from './imap_metadata.js';
 // Pure helpers — extracted to their own module for clarity and direct re-use.
 // These are also re-exported from this file so existing external imports keep working.
 import {
+  mutf7Encode,
+  mutf7Decode,
   // Public constants
   SPECIAL_USE,
   FLAGS,
@@ -147,6 +149,17 @@ function IMAPSession(options) {
     maxCommandSize: options.maxCommandSize || DEFAULT_MAX_COMMAND,
     authTimeout:    options.authTimeout    || DEFAULT_AUTH_TIMEOUT,
     delimiter:      options.delimiter      || DEFAULT_DELIMITER,   // hierarchy separator
+    metadataMaxSize: options.metadataMaxSize || 0,                 // 0 → METADATA default (2 KB)
+
+    // Watchdog for developer handlers that never call back (opt-in).
+    // 0 (default) = disabled; e.g. 30000 = answer NO after 30s of silence.
+    handlerTimeout: options.handlerTimeout || 0,
+
+    // RFC 7889 APPENDLIMIT: reject APPEND literals larger than this with
+    // NO [TOOBIG] BEFORE accepting the bytes. 0 = no specific limit
+    // (still bounded by maxCommandSize). When set, APPENDLIMIT=N is advertised.
+    maxAppendSize: options.maxAppendSize || 0,
+    discardBytes: 0,     // bytes to swallow after a TOOBIG LITERAL+ rejection
     remoteAddress:  options.remoteAddress  || null,
     localAddress:   options.localAddress   || null,
 
@@ -299,7 +312,53 @@ function IMAPSession(options) {
   }
 
   function sendTagged(tag, status, text, code) {
+    // --- Watchdog bookkeeping ---
+    // Clear the pending watchdog for this tag (the command answered in time),
+    // and suppress a LATE duplicate: if the watchdog already sent "NO server
+    // timeout" for this tag, a handler that finally calls back afterwards
+    // must not produce a second tagged response (protocol violation that
+    // desyncs the client's command pipeline).
+    if (context.watchdogs) {
+      let t = context.watchdogs.get(tag);
+      if (t) { clearTimeout(t); context.watchdogs.delete(tag); }
+    }
+    if (context.timedOutTags && context.timedOutTags.has(tag)) {
+      context.timedOutTags.delete(tag);
+      return;   // watchdog already answered this tag
+    }
     send(buildTagged(tag, status, text, code));
+  }
+
+  // Arm the per-command watchdog (opt-in via options.handlerTimeout, ms).
+  // If no tagged response is produced within the window — i.e. a developer
+  // handler never called its callback — we answer NO ourselves so the client
+  // is never left hanging, and we remember the tag to swallow a late reply.
+  //
+  // NOT armed for commands whose tagged response legitimately depends on
+  // further CLIENT input rather than on a developer handler:
+  //   IDLE          — tagged OK arrives only after the client sends DONE
+  //   AUTHENTICATE  — tagged reply follows a client continuation exchange
+  //   STARTTLS      — handshake timing is transport/client-driven
+  function armWatchdog(tag, name) {
+    if (!context.handlerTimeout || context.handlerTimeout <= 0) return;
+    if (name === 'IDLE' || name === 'AUTHENTICATE' || name === 'STARTTLS') return;
+    if (!context.watchdogs)    context.watchdogs = new Map();
+    if (!context.timedOutTags) context.timedOutTags = new Set();
+    let timer = setTimeout(function() {
+      context.watchdogs.delete(tag);
+      context.timedOutTags.add(tag);
+      // Bound the suppression set — a tag lingers only until its late reply
+      // arrives; cap protects against handlers that never call back at all.
+      if (context.timedOutTags.size > 1000) {
+        let first = context.timedOutTags.values().next().value;
+        context.timedOutTags.delete(first);
+      }
+      send(buildTagged(tag, 'NO', name + ' timed out after ' + context.handlerTimeout +
+        'ms — a storage handler did not call its callback'));
+      ev.emit('handlerTimeout', { tag: tag, command: name, timeout: context.handlerTimeout });
+    }, context.handlerTimeout);
+    if (timer.unref) timer.unref();
+    context.watchdogs.set(tag, timer);
   }
 
   function sendUntagged(data) {
@@ -379,6 +438,10 @@ function IMAPSession(options) {
       caps.push('METADATA-SERVER');
     }
 
+
+    // RFC 7889: advertise the APPEND size ceiling so clients can refuse
+    // oversized uploads locally instead of streaming and getting TOOBIG.
+    if (context.maxAppendSize > 0) caps.push('APPENDLIMIT=' + context.maxAppendSize);
     return caps;
   }
 
@@ -398,6 +461,14 @@ function IMAPSession(options) {
     if (tok.type === TOK.LITERAL) return u8ToStr(tok.value);
     if (tok.value === null) return '';
     return String(tok.value);
+  }
+
+  // Extract a MAILBOX NAME argument: string extraction + modified UTF-7
+  // decoding (RFC 3501 §5.1.3). All handler files use this for mailbox args
+  // so the developer's storage events always receive clean UTF-8 names —
+  // "&BecF0QXcBdUF6g-" from the wire arrives as "קבלות".
+  function getMailboxName(tok) {
+    return mutf7Decode(getStringValue(tok));
   }
 
 
@@ -447,12 +518,39 @@ function IMAPSession(options) {
         return;
       }
 
+      // --- Literal-discard mode (after a TOOBIG rejection of a LITERAL+
+      // APPEND, the client is already streaming the bytes; swallow them
+      // without buffering so the parser never sees them) ---
+      if (context.discardBytes > 0) {
+        let drop = Math.min(context.discardBytes, context.inputBuf.length);
+        consumeInput(drop);
+        context.discardBytes -= drop;
+        if (context.discardBytes > 0) break;   // more to swallow
+        continue;
+      }
+
       // --- COMMAND mode ---
       let result = parseCommand(context.inputBuf, 0);
 
       if (result.status === PARSE.INCOMPLETE) break;
 
       if (result.status === PARSE.NEED_CONTINUATION) {
+        // RFC 7889 APPENDLIMIT: refuse an oversized APPEND message with
+        // NO [TOOBIG] BEFORE the bytes are accepted into memory. For a
+        // synchronizing literal we simply never send "+", so the client
+        // never transmits. For LITERAL+ the client is already sending —
+        // enter discard mode for exactly literalSize bytes.
+        if (context.maxAppendSize > 0 &&
+            String(result.command).toUpperCase() === 'APPEND' &&
+            result.literalSize > context.maxAppendSize) {
+          sendTagged(result.tag, 'NO',
+            'Message exceeds APPENDLIMIT (' + context.maxAppendSize + ' bytes)', 'TOOBIG');
+          consumeInput(result.after);            // drop the command line itself
+          context.awaitingLiteral = false;
+          if (result.nonSync) context.discardBytes = result.literalSize;
+          continue;
+        }
+
         // Literal seen mid-command. For sync literals, send "+" once.
         // For LITERAL+ (nonSync), client sends bytes without waiting.
         // In both cases we simply wait for more data.
@@ -497,6 +595,8 @@ function IMAPSession(options) {
     let name = cmd.name;
     let args = cmd.args || [];
 
+    armWatchdog(tag, name);
+
     switch (name) {
       case 'CAPABILITY':   handleCapability(tag);         break;
       case 'NOOP':         handleNoop(tag);               break;
@@ -518,6 +618,19 @@ function IMAPSession(options) {
       case 'STATUS':       s.handleStatus(tag, args);       break;
       case 'CLOSE':        s.handleClose(tag);              break;
       case 'UNSELECT':     s.handleUnselect(tag);           break;
+
+      // CHECK (RFC 3501 §6.4.1) — MANDATORY command. Requests a checkpoint of
+      // the selected mailbox; for a stateless protocol layer with developer
+      // storage there is nothing to flush, so it is equivalent to NOOP in
+      // SELECTED state. Apple Mail and several sync tools issue it routinely;
+      // answering BAD (as an unknown command) breaks them.
+      case 'CHECK':
+        if (context.state !== STATE.SELECTED) {
+          sendTagged(tag, 'BAD', 'CHECK requires a selected mailbox');
+        } else {
+          sendTagged(tag, 'OK', 'CHECK completed');
+        }
+        break;
 
       // Phase 3a — message operations (FETCH, STORE, COPY, UID variants)
       case 'FETCH':        s.handleFetch(tag, args, false); break;
@@ -898,15 +1011,49 @@ function IMAPSession(options) {
   // imap_messages.js for modularity. We pass a minimal session interface `s`
   // — the handlers attach themselves to it as s.handleFetch / s.handleStore /
   // s.handleCopy and the dispatcher below calls through that.
+  // Guarded emit for storage events: when the event carries a completion
+  // callback (last argument is a function) and the developer registered NO
+  // listener, we invoke the callback immediately with a descriptive error
+  // instead of emitting into the void. Without this, a missing handler
+  // (e.g. forgetting session.on('openFolder')) leaves the tagged command
+  // unanswered FOREVER — the client just hangs with zero feedback, which is
+  // brutal to debug. With it, the client gets "NO No handler registered for
+  // 'openFolder' ..." and the developer instantly knows what to wire up.
+  //
+  // Events whose handlers are optional (move, quota, namespace, qresync,
+  // resolveVanished, messageEnvelope, messageBodyStructure, ...) are never
+  // affected: their call sites check listenerCount() BEFORE emitting and
+  // fall back to built-in behavior, so this guard never fires for them.
+  function guardedEmit(name) {
+    let args = Array.prototype.slice.call(arguments, 1);
+    let cb = args.length > 0 ? args[args.length - 1] : null;
+    if (typeof cb === 'function' && ev.listenerCount(name) === 0) {
+      cb(new Error("No handler registered for '" + name + "' — add session.on('" + name + "', ...) in your mailboxSession setup"));
+      return false;
+    }
+    return ev.emit.apply(ev, [name].concat(args));
+  }
+
+  // The `ev` facade handed to the handler modules: emit is guarded; every
+  // other EventEmitter method passes through untouched.
+  let guardedEv = {
+    emit:          guardedEmit,
+    on:            ev.on.bind(ev),
+    once:          ev.once.bind(ev),
+    off:           ev.off.bind(ev),
+    listenerCount: ev.listenerCount.bind(ev)
+  };
+
   let s = {
     context:         context,
-    ev:              ev,
+    ev:              guardedEv,
     STATE:           STATE,
     sendTagged:      sendTagged,
     sendUntagged:    sendUntagged,
     send:            send,
     requireSelected: requireSelected,
-    getStringValue:  getStringValue
+    getStringValue:  getStringValue,
+    getMailboxName:  getMailboxName
   };
   registerMessageHandlers(s);  // must be before folders (emitFetchResponse needed by QRESYNC)
   registerSearchHandlers(s);
@@ -973,9 +1120,12 @@ function IMAPSession(options) {
   // Server echoes only the capabilities it agreed to enable. Unknown names
   // are silently ignored per RFC 5161 §3.1.
   function handleEnable(tag, args) {
-    if (context.state !== STATE.AUTHENTICATED) {
-      // RFC 5161: ENABLE only in authenticated (not selected) state
-      sendTagged(tag, 'BAD', 'ENABLE only valid in authenticated state');
+    // RFC 5161 §3.1 formally restricts ENABLE to the authenticated state,
+    // but real clients (and Dovecot) also issue/accept it after SELECT —
+    // e.g. "ENABLE QRESYNC" right before a resync. Rejecting there breaks
+    // interop, so we accept in both AUTHENTICATED and SELECTED.
+    if (context.state !== STATE.AUTHENTICATED && context.state !== STATE.SELECTED) {
+      sendTagged(tag, 'BAD', 'ENABLE requires authentication');
       return;
     }
     if (args.length === 0) {
@@ -1067,7 +1217,14 @@ function IMAPSession(options) {
       count = arg.length;
     } else if (arg && arg.ranges && arg.ranges.length > 0) {
       str = formatRanges(arg.ranges);
-      for (let i = 0; i < arg.ranges.length; i += 2) count += (arg.ranges[i + 1] - arg.ranges[i]);
+      for (let i = 0; i < arg.ranges.length; i += 2) {
+        let span = arg.ranges[i + 1] - arg.ranges[i];
+        // Guard: an open-ended range ([n, Infinity]) would make count Infinity
+        // and corrupt currentFolderTotal. Such a range means "everything from
+        // n onward" — cap the decrement at the current total instead.
+        if (!isFinite(span)) { count = context.currentFolderTotal; break; }
+        count += span;
+      }
     } else if (arg && arg.uids && arg.uids.length > 0) {
       str = compressUids(arg.uids);
       count = arg.uids.length;
@@ -2800,21 +2957,34 @@ function IMAPSession(options) {
     if (typeof options === 'function') { cb = options; options = {}; }
     options = options || {};
 
+    if (context.state === STATE.CLOSED) {
+      if (cb) cb(new Error('Session is closed'));
+      return;
+    }
+    if (context.pendingCommand) {
+      if (cb) cb(new Error('Another command is pending'));
+      return;
+    }
+
     let buf = Buffer.isBuffer(message) ? message : Buffer.from(message, 'utf-8');
 
-    let args = [{ type: TOK.ATOM, value: String(folder) }];
+    // Build the command head up to (and including) the literal marker.
+    let head = String(folder);
     if (options.flags && options.flags.length) {
-      let flagToks = options.flags.map(function(f) {
-        return { type: TOK.ATOM, value: serializeFlag(f) };
-      });
-      args.push({ type: TOK.LIST, value: flagToks });
+      head += ' (' + options.flags.map(serializeFlag).join(' ') + ')';
     }
     if (options.internalDate) {
-      args.push({ type: TOK.QUOTED, value: formatInternalDate(options.internalDate) });
+      head += ' "' + formatInternalDate(options.internalDate) + '"';
     }
-    args.push({ type: TOK.LITERAL, value: buf });
 
-    clientSend('APPEND', args, function(err, info) {
+    // RFC 3501 §6.3.11: a synchronizing literal ({N}) requires waiting for
+    // the server's "+" continuation before sending the message bytes.
+    // With LITERAL+ (RFC 7888, advertised as LITERAL+ or LITERAL-) we may
+    // use {N+} and stream everything in one shot — preferred when available.
+    let caps = context.remoteCaps || {};
+    let nonSync = !!(caps['LITERAL+'] || caps['LITERAL-']);
+
+    function handleTagged(err, info) {
       if (err) return cb && cb(err);
       if (info.status !== 'OK') return cb && cb(new Error('APPEND failed: ' + info.text));
       // Parse APPENDUID code if present (RFC 4315)
@@ -2824,7 +2994,30 @@ function IMAPSession(options) {
         if (m) { result.uidValidity = parseInt(m[1], 10); result.uid = parseInt(m[2], 10); }
       }
       if (cb) cb(null, result);
-    });
+    }
+
+    let tag = context.tagGen();
+
+    if (nonSync) {
+      // Non-synchronizing: "{N+}\r\n" + bytes + CRLF, all at once.
+      context.pendingCommand = { tag: tag, untagged: [], cb: handleTagged };
+      send(Buffer.from(tag + ' APPEND ' + head + ' {' + buf.length + '+}\r\n', 'utf-8'));
+      send(buf);
+      send(Buffer.from('\r\n', 'utf-8'));
+      return;
+    }
+
+    // Synchronizing: send "{N}\r\n", wait for "+" continuation, then the bytes.
+    context.pendingCommand = {
+      tag: tag,
+      untagged: [],
+      onContinuation: function() {
+        send(buf);
+        send(Buffer.from('\r\n', 'utf-8'));
+      },
+      cb: handleTagged
+    };
+    send(Buffer.from(tag + ' APPEND ' + head + ' {' + buf.length + '}\r\n', 'utf-8'));
   }
 
   // --- EXPUNGE / UID EXPUNGE ---

@@ -78,12 +78,18 @@ export function registerSearchHandlers(s) {
       }
       results = results || [];
 
-      // Extract seq or uid numbers AND track highest modseq
+      // Extract seq or uid numbers AND track highest modseq.
+      // Two accepted shapes (both appear naturally in developer code):
+      //   [{seq, uid, modseq?}, ...]  — the documented rich form
+      //   [3, 7, 12]                  — plain numbers (seq or uid per command
+      //                                 type); previously this yielded an
+      //                                 EMPTY "* SEARCH" with zero feedback.
       let nums = [];
       let highestModseq = 0;
       for (let i = 0; i < results.length; i++) {
         let r = results[i];
         if (r == null) continue;
+        if (typeof r === 'number') { nums.push(r); continue; }
         let n = byUid ? r.uid : r.seq;
         if (typeof n === 'number') nums.push(n);
         if (typeof r.modseq === 'number' && r.modseq > highestModseq) highestModseq = r.modseq;

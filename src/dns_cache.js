@@ -13,8 +13,39 @@ import { domainToAscii, isAscii } from './utils.js';
 // ('xn--4db2cf.co.il'). The cache key is also the ASCII form, so lookups
 // for the same domain spelled two different ways share a cache entry.
 
-const DEFAULT_TTL = 300000; // 5 minutes
-let cache = {};
+const DEFAULT_TTL = 300000;      // 5 minutes — positive results
+const NEGATIVE_TTL = 60000;      // 1 minute — failed lookups (NXDOMAIN etc.)
+                                 // Without negative caching, a sender spamming
+                                 // from a nonexistent domain triggers a fresh
+                                 // DNS query on EVERY message (SPF+DKIM+DMARC
+                                 // each ask) — an easy amplification vector.
+const MAX_ENTRIES = 10000;       // hard cap — evict oldest-expiring beyond this
+let cache = new Map();           // Map preserves insertion order → cheap FIFO-ish eviction
+
+// Periodic GC: drop expired entries so the cache doesn't grow unbounded on a
+// busy server seeing many unique domains. unref'd so it never keeps the
+// process alive (same pattern as rate_limit.js).
+const GC_INTERVAL = 60000;
+const gcTimer = setInterval(function() {
+  let now = Date.now();
+  cache.forEach(function(entry, key) {
+    if (entry.expires <= now) cache.delete(key);
+  });
+}, GC_INTERVAL);
+if (gcTimer.unref) gcTimer.unref();
+
+function cacheSet(key, entry) {
+  // Enforce the size cap: delete oldest-inserted entries first. Map
+  // iteration order is insertion order, so this is O(evicted).
+  if (cache.size >= MAX_ENTRIES) {
+    let toEvict = cache.size - MAX_ENTRIES + 1;
+    for (let k of cache.keys()) {
+      cache.delete(k);
+      if (--toEvict <= 0) break;
+    }
+  }
+  cache.set(key, entry);
+}
 
 // PTR lookups take an IP, not a domain — never IDN-encode those.
 function normalizeName(type, name) {
@@ -25,12 +56,17 @@ function normalizeName(type, name) {
   return ascii || name;
 }
 
+// In-flight request coalescing: if 3 concurrent messages from the same domain
+// all trigger an SPF TXT lookup, only ONE query goes to the resolver — the
+// rest attach to its completion. Prevents thundering-herd on cache misses.
+let inFlight = new Map();   // key → [cb, cb, ...]
+
 function lookup(type, name, cb) {
   name = normalizeName(type, name);
   let key = type + ':' + name;
-  let cached = cache[key];
+  let cached = cache.get(key);
   if (cached && cached.expires > Date.now()) {
-    return cb(null, cached.data);
+    return cb(cached.err || null, cached.data);
   }
 
   let resolver;
@@ -43,11 +79,22 @@ function lookup(type, name, cb) {
     default:      return cb(new Error('Unknown DNS type: ' + type));
   }
 
+  // Coalesce concurrent identical lookups
+  let waiters = inFlight.get(key);
+  if (waiters) { waiters.push(cb); return; }
+  inFlight.set(key, [cb]);
+
   resolver(name, function(err, data) {
     if (!err && data) {
-      cache[key] = { data: data, expires: Date.now() + DEFAULT_TTL };
+      cacheSet(key, { data: data, expires: Date.now() + DEFAULT_TTL });
+    } else if (err && (err.code === 'ENOTFOUND' || err.code === 'ENODATA')) {
+      // Negative-cache definitive misses (short TTL). Transient failures
+      // (SERVFAIL, timeouts) are NOT cached — the next attempt may succeed.
+      cacheSet(key, { err: err, data: undefined, expires: Date.now() + NEGATIVE_TTL });
     }
-    cb(err, data);
+    let cbs = inFlight.get(key) || [];
+    inFlight.delete(key);
+    for (let i = 0; i < cbs.length; i++) cbs[i](err, data);
   });
 }
 
@@ -58,13 +105,14 @@ function aaaa(name, cb)    { lookup('AAAA', name, cb); }
 function mx(name, cb)      { lookup('MX', name, cb); }
 function ptr(ip, cb)       { lookup('PTR', ip, cb); }
 
-function clear() { cache = {}; }
+function clear() { cache.clear(); }
 
 function remove(name) {
-  let keys = Object.keys(cache);
-  for (let i = 0; i < keys.length; i++) {
-    if (keys[i].indexOf(name) >= 0) delete cache[keys[i]];
-  }
+  let toDelete = [];
+  cache.forEach(function(_entry, key) {
+    if (key.indexOf(name) >= 0) toDelete.push(key);
+  });
+  for (let i = 0; i < toDelete.length; i++) cache.delete(toDelete[i]);
 }
 
 

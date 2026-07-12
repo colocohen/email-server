@@ -14,11 +14,63 @@ const TE = new TextEncoder();
 
 // Pre-compiled patterns for encoded-word decoding (called per header)
 const RE_ADJACENT_ENCODED = /\?=\s+=\?/g;
-const RE_ENCODED_WORD = /=\?UTF-8\?([QB])\?(.+?)\?=/gi;
+// RFC 2047 encoded-word: =?charset?Q|B?data?=  — any charset, optionally with
+// an RFC 2231 language tag (=?utf-8*en?...?=) which we strip.
+const RE_ENCODED_WORD = /=\?([^?*]+)(?:\*[^?]*)?\?([QB])\?([^?]*)\?=/gi;
 const RE_UNDERSCORE = /_/g;
 const RE_CRLF_NORMALIZE = /\r?\n/g;
 const RE_QP_SOFTBREAK = /=\r?\n/g;
 const RE_WHITESPACE_COMPRESS = /\s+/g;
+
+// ------------------------------------------------------------
+//  Charset decoding — bytes → string in ANY charset
+// ------------------------------------------------------------
+// Node's TextDecoder ships with the full WHATWG encoding set (ISO-8859-*,
+// windows-125x, Shift_JIS, EUC-KR, GB18030, Big5, KOI8, ISO-2022-JP, ...),
+// so unlike parsers that pull in iconv-lite we can support real-world mail
+// charsets with zero dependencies.
+//
+// Decoders are cached per charset (constructing one is not free), and
+// unknown/garbage charset labels fall back to UTF-8 → latin1, which never
+// throws and matches how mail clients behave with broken senders.
+const CHARSET_ALIASES = {
+  // Labels seen in the wild that TextDecoder doesn't accept directly
+  'utf8': 'utf-8', 'unicode-1-1-utf-8': 'utf-8',
+  'ascii': 'windows-1252', 'us-ascii': 'windows-1252', 'ansi_x3.4-1968': 'windows-1252',
+  'latin1': 'iso-8859-1', 'latin-1': 'iso-8859-1', 'l1': 'iso-8859-1',
+  'cp1250': 'windows-1250', 'cp1251': 'windows-1251', 'cp1252': 'windows-1252',
+  'cp1253': 'windows-1253', 'cp1254': 'windows-1254', 'cp1255': 'windows-1255',
+  'cp1256': 'windows-1256', 'cp1257': 'windows-1257', 'cp1258': 'windows-1258',
+  'iso8859-1': 'iso-8859-1', 'iso8859-2': 'iso-8859-2', 'iso8859-8': 'iso-8859-8',
+  'iso-8859-8-i': 'iso-8859-8',      // logical Hebrew — same byte map
+  'ks_c_5601-1987': 'euc-kr', 'cp949': 'euc-kr',
+  'gb2312': 'gbk',                    // GB2312 is a subset; gbk decodes both
+  'cp932': 'shift_jis', 'sjis': 'shift_jis'
+};
+const decoderCache = new Map();
+
+function getDecoder(charset) {
+  let label = String(charset || 'utf-8').trim().toLowerCase();
+  label = CHARSET_ALIASES[label] || label;
+  let dec = decoderCache.get(label);
+  if (dec !== undefined) return dec;
+  try {
+    dec = new TextDecoder(label);
+  } catch (e) {
+    dec = null;   // unknown label — cache the miss too
+  }
+  decoderCache.set(label, dec);
+  return dec;
+}
+
+// Decode bytes with the given charset. Falls back to UTF-8 (non-fatal mode:
+// invalid sequences become U+FFFD, never throws) when the charset is unknown.
+function decodeCharset(u8, charset) {
+  if (!(u8 instanceof Uint8Array)) u8 = toU8(u8);
+  let dec = charset ? getDecoder(charset) : null;
+  if (dec) return dec.decode(u8);
+  return u8ToStr(u8);   // UTF-8 with replacement chars
+}
 
 function ensureCRLF(str) {
   return String(str || '').replace(RE_CRLF_NORMALIZE, '\r\n');
@@ -53,10 +105,16 @@ function base64Wrap76(b64) {
   return out;
 }
 
+// Pre-built decode map — built once at module load, not per call.
+const B64_DECODE_MAP = (function() {
+  let m = {};
+  for (let i = 0; i < B64.length; i++) m[B64[i]] = i;
+  return m;
+})();
+
 function base64Decode(str) {
   let s = String(str || '').replace(/\s+/g, '');
-  let map = {};
-  for (let i = 0; i < B64.length; i++) map[B64[i]] = i;
+  let map = B64_DECODE_MAP;
   let out = [];
   for (let j = 0; j < s.length; j += 4) {
     let c1 = map[s[j]], c2 = map[s[j + 1]];
@@ -193,10 +251,13 @@ function encodeHeaderValue(value) {
 
 function decodeEncodedWords(v) {
   if (!v) return '';
+  // RFC 2047 §6.2: whitespace between adjacent encoded-words is not displayed
   let result = v.replace(RE_ADJACENT_ENCODED, '?==?');
-  result = result.replace(RE_ENCODED_WORD, function(_, mode, data) {
-    if (mode.toUpperCase() === 'B') return u8ToStr(base64Decode(data));
-    return u8ToStr(qpDecode(data.replace(RE_UNDERSCORE, ' ')));
+  result = result.replace(RE_ENCODED_WORD, function(_, charset, mode, data) {
+    let bytes = (mode.toUpperCase() === 'B')
+      ? base64Decode(data)
+      : qpDecode(data.replace(RE_UNDERSCORE, ' '));
+    return decodeCharset(bytes, charset);
   });
   return result;
 }
@@ -615,9 +676,11 @@ function parseMessage(rawU8) {
 
   let subjRaw = headerLookup(headers, 'Subject');
   let subject = decodeEncodedWords(subjRaw || '') || subjRaw || '';
-  let from = headerLookup(headers, 'From') || '';
-  let to = headerLookup(headers, 'To') || '';
-  let cc = headerLookup(headers, 'Cc') || '';
+  // Address headers may carry RFC 2047 display names ("=?windows-1255?B?...?= <a@b>").
+  // Decode them so `from`/`to`/`cc` are human-readable, like mailparser does.
+  let from = decodeEncodedWords(headerLookup(headers, 'From') || '');
+  let to = decodeEncodedWords(headerLookup(headers, 'To') || '');
+  let cc = decodeEncodedWords(headerLookup(headers, 'Cc') || '');
   let date = headerLookup(headers, 'Date') || '';
   let messageId = headerLookup(headers, 'Message-ID') || '';
 
@@ -630,52 +693,64 @@ function parseMessage(rawU8) {
     let dataU8 = decodeBodyByTE(bodyStr, teStr);
     let mime = (ctObj.type + '/' + ctObj.subtype).toLowerCase();
 
+    // Decode text parts with the DECLARED charset (Content-Type ...; charset=X).
+    // A part in ISO-8859-8 / windows-1255 / Shift_JIS etc. would previously be
+    // force-decoded as UTF-8 and come out as mojibake.
     if (mime === 'text/plain' && text === null) {
-      text = u8ToStr(dataU8).replace(/\r\n$/, '');
+      text = decodeCharset(dataU8, ctObj.params && ctObj.params.charset).replace(/\r\n$/, '');
       return;
     }
     if (mime === 'text/html' && html === null) {
-      html = u8ToStr(dataU8).replace(/\r\n$/, '');
+      html = decodeCharset(dataU8, ctObj.params && ctObj.params.charset).replace(/\r\n$/, '');
       return;
     }
 
-    let cd = headerLookup(partHeaders || [], 'Content-Disposition') || '';
-    let isAttach = /attachment/i.test(cd) || /inline/i.test(cd) || (mime !== 'text/plain' && mime !== 'text/html');
+    let cdRaw = headerLookup(partHeaders || [], 'Content-Disposition') || '';
+    let cd = parseContentDispositionValue(cdRaw);
+    let isAttach = cd.type === 'attachment' || cd.type === 'inline' ||
+                   (mime !== 'text/plain' && mime !== 'text/html');
 
     if (isAttach) {
-      let fn = /filename\*?="?([^";]+)"?/i.exec(cd);
-      if (!fn) fn = /name="?([^";]+)"?/i.exec(headerLookup(partHeaders || [], 'Content-Type') || '');
-      let filename = fn ? fn[1] : 'file';
+      // Filename resolution order (matching mailparser behavior):
+      //   1. Content-Disposition filename / filename* (RFC 2231 decoded)
+      //   2. Content-Type name parameter
+      //   3. RFC 2047 encoded-words inside either (some clients use those
+      //      instead of RFC 2231 — technically wrong, universally seen)
+      let filename = cd.params.filename ||
+                     (ctObj.params && ctObj.params.name) || 'file';
+      if (filename.indexOf('=?') >= 0) filename = decodeEncodedWords(filename);
+
       attachments.push({
         filename: filename,
         contentType: mime,
         size: dataU8.length,
         content: dataU8,
         cid: (headerLookup(partHeaders || [], 'Content-ID') || '').replace(/[<>]/g, '') || null,
-        related: /inline/i.test(cd)
+        related: cd.type === 'inline'
       });
     }
   }
 
-  if (ct.type === 'multipart') {
-    let parts = splitMultipart(hb.body, ct.params['boundary'] || '');
-    for (let i = 0; i < parts.length; i++) {
-      let pCT = parseContentType(headerLookup(parts[i].headers, 'Content-Type'));
-      let pTE = parseTransfer(headerLookup(parts[i].headers, 'Content-Transfer-Encoding'));
-      if (pCT.type === 'multipart') {
-        let subparts = splitMultipart(parts[i].body, pCT.params['boundary'] || '');
-        for (let j = 0; j < subparts.length; j++) {
-          let sCT = parseContentType(headerLookup(subparts[j].headers, 'Content-Type'));
-          let sTE = parseTransfer(headerLookup(subparts[j].headers, 'Content-Transfer-Encoding'));
-          handleSingle(sCT, sTE, subparts[j].body, subparts[j].headers);
-        }
-      } else {
-        handleSingle(pCT, pTE, parts[i].body, parts[i].headers);
+  // Recursive multipart walk — real-world mail commonly nests three or more
+  // levels deep (mixed > alternative > related > html + inline images).
+  // MAX_MIME_DEPTH guards against maliciously deep nesting (billion-laughs
+  // style); 20 levels is far beyond anything legitimate.
+  const MAX_MIME_DEPTH = 20;
+  function walkPart(ctObj, teStr, bodyStr, partHeaders, depth) {
+    if (ctObj.type === 'multipart') {
+      if (depth >= MAX_MIME_DEPTH) return;   // refuse to recurse further
+      let children = splitMultipart(bodyStr, ctObj.params['boundary'] || '');
+      for (let i = 0; i < children.length; i++) {
+        let cCT = parseContentType(headerLookup(children[i].headers, 'Content-Type'));
+        let cTE = parseTransfer(headerLookup(children[i].headers, 'Content-Transfer-Encoding'));
+        walkPart(cCT, cTE, children[i].body, children[i].headers, depth + 1);
       }
+      return;
     }
-  } else {
-    handleSingle(ct, te, hb.body, headers);
+    handleSingle(ctObj, teStr, bodyStr, partHeaders);
   }
+
+  walkPart(ct, te, hb.body, headers, 0);
 
   return {
     headers: headers,
@@ -737,20 +812,116 @@ function headerLookup(headers, name) {
   return null;
 }
 
+// ------------------------------------------------------------
+//  RFC 2231-aware MIME parameter parsing
+// ------------------------------------------------------------
+// Handles all three real-world parameter styles:
+//   plain:        filename="report.pdf"
+//   extended:     filename*=utf-8''%D7%93%D7%95%D7%97.pdf     (charset + %-encoding)
+//   continuations: filename*0*=utf-8''%D7%93; filename*1*=%D7%95%D7%97.pdf
+// Continuation segments are reassembled in numeric order; only segment 0
+// carries the charset'lang' prefix. Non-starred continuation segments
+// (filename*1=) are literal text appended as-is.
+function parseMimeParams(paramStr) {
+  if (!paramStr) return {};
+  let rx = /;\s*([^\s=;]+)\s*=\s*(?:"((?:[^"\\]|\\.)*)"|([^;\s]*))/g;
+  let rawParams = {};   // exact key (incl. *N* suffixes) → value
+  let t;
+  while ((t = rx.exec(paramStr))) {
+    let key = t[1].toLowerCase();
+    let val = t[2] !== undefined ? t[2].replace(/\\(.)/g, '$1') : (t[3] || '');
+    rawParams[key] = val;
+  }
+
+  // Group RFC 2231 pieces: base name → { plain, extended, segments: {n: {val, encoded}} }
+  let out = {};
+  let cont = {};   // baseName → array of { n, encoded, val }
+
+  for (let key in rawParams) {
+    if (!rawParams.hasOwnProperty(key)) continue;
+    let val = rawParams[key];
+
+    let m = /^(.+?)\*(\d+)(\*)?$/.exec(key);        // name*N or name*N*
+    if (m) {
+      let base = m[1];
+      (cont[base] = cont[base] || []).push({ n: parseInt(m[2], 10), encoded: !!m[3], val: val });
+      continue;
+    }
+    if (key.charAt(key.length - 1) === '*') {        // name*  (extended, single)
+      let base = key.slice(0, -1);
+      out[base] = decodeRfc2231Value(val);
+      continue;
+    }
+    if (!(key in out)) out[key] = val;               // plain — don't clobber decoded extended
+  }
+
+  // Reassemble continuations
+  for (let base in cont) {
+    if (!cont.hasOwnProperty(base)) continue;
+    let segs = cont[base].sort(function(a, b) { return a.n - b.n; });
+    // Charset comes from segment 0's charset'lang' prefix (when encoded)
+    let charset = null;
+    let assembled = '';
+    for (let i = 0; i < segs.length; i++) {
+      let s = segs[i];
+      let v = s.val;
+      if (s.encoded) {
+        if (s.n === 0) {
+          let cm = /^([^']*)'[^']*'([\s\S]*)$/.exec(v);
+          if (cm) { charset = cm[1] || null; v = cm[2]; }
+        }
+        assembled += pctDecodeToString(v, charset);
+      } else {
+        assembled += v;                              // literal segment
+      }
+    }
+    out[base] = assembled;                           // continuations win over plain
+  }
+
+  return out;
+}
+
+// Decode a single RFC 2231 extended value: charset'lang'percent-encoded
+function decodeRfc2231Value(v) {
+  let m = /^([^']*)'[^']*'([\s\S]*)$/.exec(v);
+  if (!m) return v;                                  // malformed — return as-is
+  return pctDecodeToString(m[2], m[1] || null);
+}
+
+// Percent-decode to BYTES, then charset-decode — %-escapes are byte values in
+// the declared charset, so decodeURIComponent (UTF-8-only) would be wrong.
+function pctDecodeToString(s, charset) {
+  let bytes = [];
+  for (let i = 0; i < s.length; i++) {
+    let c = s.charCodeAt(i);
+    if (c === 0x25 /* % */ && i + 2 < s.length) {
+      let hex = parseInt(s.substr(i + 1, 2), 16);
+      if (!isNaN(hex)) { bytes.push(hex); i += 2; continue; }
+    }
+    bytes.push(c & 0xFF);
+  }
+  return decodeCharset(Uint8Array.from(bytes), charset || 'utf-8');
+}
+
+// Parse a Content-Disposition header VALUE into { type, params } with full
+// RFC 2231 parameter handling. (Named ...Value to avoid clashing with the
+// tree parser's parseContentDisposition.)
+function parseContentDispositionValue(v) {
+  if (!v) return { type: null, params: {} };
+  let m = /^\s*([^;\s]+)\s*(;[\s\S]*)?$/.exec(v);
+  if (!m) return { type: null, params: {} };
+  return { type: m[1].toLowerCase(), params: parseMimeParams(m[2] || '') };
+}
+
 function parseContentType(v) {
   if (!v) return { type: 'text', subtype: 'plain', params: {} };
-  let m = /^\s*([^\/\s;]+)\/([^;\s]+)\s*(;.*)?$/.exec(v);
+  let m = /^\s*([^\/\s;]+)\/([^;\s]+)\s*(;[\s\S]*)?$/.exec(v);
   if (!m) return { type: 'text', subtype: 'plain', params: {} };
-  let params = {};
-  if (m[3]) {
-    // Match both quoted and unquoted parameter values
-    let rx = /;\s*([^\s=;]+)\s*=\s*(?:"([^"]*)"|([^;\s]*))/g;
-    let t;
-    while ((t = rx.exec(m[3]))) {
-      params[t[1].toLowerCase()] = t[2] !== undefined ? t[2] : t[3];
-    }
-  }
-  return { type: m[1].toLowerCase(), subtype: m[2].toLowerCase(), params: params };
+  return {
+    type: m[1].toLowerCase(),
+    subtype: m[2].toLowerCase(),
+    params: parseMimeParams(m[3] || '')
+  };
 }
 
 function parseTransfer(v) {

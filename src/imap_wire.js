@@ -178,21 +178,25 @@ function readAstringAtom(buf, pos) {
 //   { incomplete: true }                        — starts with " but no closing " yet
 function readQuoted(buf, pos) {
   if (buf[pos] !== DQUOTE) return null;
-  let out = '';
+  // Accumulate raw BYTES and UTF-8-decode once at the end. The previous
+  // per-byte String.fromCharCode approach mangled multi-byte UTF-8: each
+  // byte of a character like 'ש' (0xD7 0xA9) became its own Latin-1 code
+  // point. RFC 3501 formally forbids 8-bit in quoted strings, but real
+  // clients send UTF-8 mailbox names and search values this way — decode
+  // them correctly rather than corrupting.
+  let bytes = [];
   let i = pos + 1;
   while (i < buf.length) {
     let b = buf[i];
     if (b === DQUOTE) {
-      return { type: TOK.QUOTED, value: out, end: i + 1 };
+      return { type: TOK.QUOTED, value: u8ToStr(Uint8Array.from(bytes)), end: i + 1 };
     }
     if (b === BACKSLASH) {
       if (i + 1 >= buf.length) return { incomplete: true };
       let next = buf[i + 1];
       // RFC 3501: quoted-specials = DQUOTE / "\"
-      if (next !== DQUOTE && next !== BACKSLASH) {
-        // Lenient: allow other chars after backslash
-      }
-      out += String.fromCharCode(next);
+      // Lenient: allow other chars after backslash
+      bytes.push(next);
       i += 2;
       continue;
     }
@@ -200,7 +204,7 @@ function readQuoted(buf, pos) {
       // Quoted strings cannot contain CR/LF
       return null;
     }
-    out += String.fromCharCode(b);
+    bytes.push(b);
     i++;
   }
   return { incomplete: true };

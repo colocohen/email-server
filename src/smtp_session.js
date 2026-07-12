@@ -103,6 +103,7 @@ function SMTPSession(options) {
     inputBuf: Buffer.alloc(0),
     dataChunks: [],
     dataSize: 0,
+    dataCarry: null,
 
     // BDAT accumulation
     bdatExpect: 0,
@@ -205,6 +206,7 @@ function SMTPSession(options) {
     context.rcptTo = [];
     context.rcptParams = [];
     context.dataChunks = []; context.dataSize = 0;
+    context.dataCarry = null;
     context.bdatExpect = 0;
     context.bdatAccum = [];
     context.bdatTotal = 0;
@@ -503,6 +505,7 @@ function SMTPSession(options) {
         }
         context.state = STATE.DATA;
         context.dataChunks = []; context.dataSize = 0;
+        context.dataCarry = null;
         sendReply(354, 'End data with <CRLF>.<CRLF>');
         break;
 
@@ -542,7 +545,14 @@ function SMTPSession(options) {
           context.authInProgress = true;
           context.authMechanism = 'LOGIN';
           context.authData = {};
-          sendReply(334, Buffer.from('Username:').toString('base64'));
+          if (cmd.initial) {
+            // Rare but legal: AUTH LOGIN <base64-username> (initial response).
+            // Treat it as the first continuation line — handleAuthLogin will
+            // store the username and prompt for the password.
+            handleAuthLogin(cmd.initial);
+          } else {
+            sendReply(334, Buffer.from('Username:').toString('base64'));
+          }
         } else if (mech === 'XOAUTH2') {
           // Bearer-token auth (RFC 7628 / Google / Microsoft). Payload may
           // be provided inline (SASL-IR) or requested via continuation.
@@ -763,7 +773,20 @@ function SMTPSession(options) {
 
         // Regular command
         let cr = indexOfCRLF(context.inputBuf, 0);
-        if (cr < 0) break;
+        if (cr < 0) {
+          // No complete line yet. RFC 5321 §4.5.3.1.6 caps command lines at
+          // 512 octets (with extensions somewhat more — AUTH lines carry
+          // base64 blobs). We allow a generous 16 KB; beyond that the peer is
+          // either broken or hostile (a CRLF-less byte stream would otherwise
+          // grow inputBuf without bound — a trivial memory-exhaustion vector).
+          if (context.inputBuf.length > 16384) {
+            sendReply(500, 'Line too long', '5.5.2');
+            ev.emit('error', new Error('SMTP command line exceeded 16KB without CRLF'));
+            close();
+            return;
+          }
+          break;
+        }
         let lineU8 = context.inputBuf.slice(0, cr);
         consumeInput(cr + 2);
 
@@ -775,21 +798,54 @@ function SMTPSession(options) {
 
       // --- DATA mode ---
       if (context.state === STATE.DATA) {
-        // Look for \r\n.\r\n terminator
+        // Look for the \r\n.\r\n terminator. Two subtleties:
+        //
+        //  (a) EMPTY BODY: for a headers-only message the client sends
+        //      "DATA\r\n" then ".\r\n" — the terminating dot appears at the
+        //      very start of the body with no preceding CRLF in the buffer.
+        //      Per RFC 5321 §4.1.1.4 the CRLF that "precedes" the dot is the
+        //      one that ended the DATA command line itself.
+        //
+        //  (b) CHUNK BOUNDARY: TCP may split "\r\n.\r\n" across two chunks
+        //      (e.g. chunk A ends with "...\r\n." and chunk B starts with
+        //      "\r\n"). Earlier chunks are moved to dataChunks and inputBuf
+        //      is reset, so a scan of inputBuf alone would miss the split
+        //      terminator. We therefore keep the last 4 bytes of every
+        //      flushed chunk as a "carry" prefix for the next scan.
+        //
+        // `dataCarry` holds up to the last 4 body bytes already counted in
+        // dataChunks; the scan runs over carry+inputBuf so any terminator
+        // spanning the boundary is found. Offsets into the combined buffer
+        // are translated back before slicing.
+        let carry = context.dataCarry || Buffer.alloc(0);
+        let buf = carry.length > 0
+          ? Buffer.concat([carry, context.inputBuf])
+          : context.inputBuf;
+
         let termAt = -1;
-        let buf = context.inputBuf;
-        for (let i = 2; i + 2 < buf.length; i++) {
-          if (buf[i - 2] === 13 && buf[i - 1] === 10 && buf[i] === 46 && buf[i + 1] === 13 && buf[i + 2] === 10) {
-            termAt = i - 2;
-            break;
+        // Case (a): terminator at the very start of the body
+        if (context.dataSize === 0 && carry.length === 0 &&
+            buf.length >= 3 && buf[0] === 46 && buf[1] === 13 && buf[2] === 10) {
+          termAt = 0;
+        }
+        if (termAt < 0) {
+          for (let i = 2; i + 2 < buf.length; i++) {
+            if (buf[i - 2] === 13 && buf[i - 1] === 10 && buf[i] === 46 && buf[i + 1] === 13 && buf[i + 2] === 10) {
+              termAt = i - 2;
+              break;
+            }
           }
         }
 
         if (termAt < 0) {
-          // No terminator yet — accumulate chunk (O(1) push, not O(n) copy)
-          context.dataChunks.push(Buffer.from(context.inputBuf));
-          context.dataSize += context.inputBuf.length;
+          // No terminator yet — accumulate chunk (O(1) push, not O(n) copy),
+          // keeping the last 4 bytes as carry for boundary-spanning detection.
+          let chunk = Buffer.from(context.inputBuf);
+          context.dataChunks.push(chunk);
+          context.dataSize += chunk.length;
           context.inputBuf = Buffer.alloc(0);
+          let tail = buf.length >= 4 ? buf.subarray(buf.length - 4) : buf;
+          context.dataCarry = Buffer.from(tail);
 
           // Check size limit
           if (context.dataSize > context.maxSize) {
@@ -799,11 +855,33 @@ function SMTPSession(options) {
           break;
         }
 
-        // Found terminator — push remaining body, concat once
-        let bodyPart = context.inputBuf.slice(0, termAt);
-        context.dataChunks.push(Buffer.from(bodyPart));
-        context.dataSize += bodyPart.length;
-        consumeInput(termAt + 5); // skip past \r\n.\r\n
+        // Found terminator. termAt is an offset into carry+inputBuf; the
+        // carry bytes are ALREADY included in dataChunks/dataSize, so we
+        // must (1) trim any carry bytes that turned out to be part of the
+        // terminator from the accumulated chunks, and (2) slice inputBuf
+        // relative to the carry length.
+        let termInInput = termAt - carry.length;   // may be negative
+        if (termInInput < 0) {
+          // Terminator started inside the carry — drop (-termInInput) bytes
+          // from the tail of the accumulated data.
+          let drop = -termInInput;
+          context.dataSize -= drop;
+          while (drop > 0 && context.dataChunks.length > 0) {
+            let last = context.dataChunks[context.dataChunks.length - 1];
+            if (last.length <= drop) { drop -= last.length; context.dataChunks.pop(); }
+            else {
+              context.dataChunks[context.dataChunks.length - 1] = last.subarray(0, last.length - drop);
+              drop = 0;
+            }
+          }
+          consumeInput(termAt + 5 - carry.length); // remaining terminator bytes in inputBuf
+        } else {
+          let bodyPart = context.inputBuf.slice(0, termInInput);
+          context.dataChunks.push(Buffer.from(bodyPart));
+          context.dataSize += bodyPart.length;
+          consumeInput(termInInput + 5); // skip past \r\n.\r\n
+        }
+        context.dataCarry = null;
 
         let body = undotStuff(Buffer.concat(context.dataChunks, context.dataSize));
         context.dataChunks = []; context.dataSize = 0;
@@ -813,8 +891,14 @@ function SMTPSession(options) {
 
       // --- BDAT mode ---
       if (context.state === STATE.BDAT) {
+        // Note: a zero-size chunk ("BDAT 0" / "BDAT 0 LAST") is legal per
+        // RFC 3030 — "BDAT 0 LAST" is a standard way to terminate a chunked
+        // transfer. It must be acknowledged (250) and, when LAST, finalize
+        // the message exactly like a data-carrying final chunk. The previous
+        // code silently changed state without replying, hanging the client.
+        if (context.bdatExpect > 0 && context.inputBuf.length === 0) break;
+
         if (context.bdatExpect > 0) {
-          if (context.inputBuf.length === 0) break;
           let take = Math.min(context.bdatExpect, context.inputBuf.length);
           let piece = context.inputBuf.slice(0, take);
           context.bdatAccum.push(piece);
@@ -823,28 +907,26 @@ function SMTPSession(options) {
           consumeInput(take);
 
           if (context.bdatExpect > 0) break; // waiting for more
+        }
 
-          // Chunk complete
-          sendReply(250, 'Ok chunk', '2.0.0');
+        // Chunk complete (possibly zero-length)
+        sendReply(250, 'Ok chunk', '2.0.0');
 
-          if (context.bdatLast) {
-            // Assemble full message
-            let raw = new Uint8Array(context.bdatTotal);
-            let off = 0;
-            for (let i = 0; i < context.bdatAccum.length; i++) {
-              raw.set(context.bdatAccum[i], off);
-              off += context.bdatAccum[i].length;
-            }
-            context.bdatAccum = [];
-            context.bdatTotal = 0;
-            context.bdatLast = false;
-            context.state = STATE.READY;
-            finalizeMessage(raw);
-          } else {
-            // Wait for next BDAT command
-            context.state = STATE.RCPT;
+        if (context.bdatLast) {
+          // Assemble full message
+          let raw = new Uint8Array(context.bdatTotal);
+          let off = 0;
+          for (let i = 0; i < context.bdatAccum.length; i++) {
+            raw.set(context.bdatAccum[i], off);
+            off += context.bdatAccum[i].length;
           }
+          context.bdatAccum = [];
+          context.bdatTotal = 0;
+          context.bdatLast = false;
+          context.state = STATE.READY;
+          finalizeMessage(raw);
         } else {
+          // Wait for next BDAT command
           context.state = STATE.RCPT;
         }
         continue;
@@ -1119,6 +1201,7 @@ function SMTPSession(options) {
     // Clean up buffers
     context.inputBuf = Buffer.alloc(0);
     context.dataChunks = []; context.dataSize = 0;
+    context.dataCarry = null;
     context.bdatAccum = [];
 
     context.state = STATE.CLOSED;

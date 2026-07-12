@@ -1,5 +1,6 @@
 
 import crypto from 'node:crypto';
+import dns from 'node:dns';
 
 
 // ============================================================
@@ -349,11 +350,6 @@ function buildRequiredDNS(domain, dkim, policy, mtaSts, tlsRpt) {
 // ============================================================
 
 function verifyDNS(domain, dkim, mtaSts, tlsRpt, cb) {
-  let dns;
-  try { dns = require('dns'); } catch(e) {
-    return cb(new Error('dns module not available'));
-  }
-
   let results = { dkim: false, spf: false, dmarc: false, mx: false };
   if (mtaSts) results.mtaSts = false;
   if (tlsRpt) results.tlsRpt = false;

@@ -4,7 +4,7 @@
 
 <h1 align="center">email-server</h1>
 <p align="center">
-  <em>📧 Easily run your own mail server — complete email infrastructure with full control, in a single Node.js package with zero dependencies.</em>
+  <em>📧 Easily run your own mail server — complete email infrastructure with full control, in a single Node.js package with just one small dependency.</em>
 </p>
 
 <p align="center">
@@ -26,7 +26,7 @@
 ### Protocols — full server and client for all three
 
 * 📬 **SMTP Server** — inbound (port 25), submission (port 587), implicit TLS (465). STARTTLS, AUTH PLAIN/LOGIN, XOAUTH2, PROXY protocol.
-* 📤 **SMTP Client** — direct delivery via MX lookup or via relay/smarthost. Connection pooling, retry with backoff, per-domain rate limiting.
+* 📤 **SMTP Client** — direct delivery via MX lookup or via relay/smarthost. Connection pooling, retry with backoff, and per-domain outbound throttling.
 * 📥 **IMAP Server** — RFC 3501 + UIDPLUS, CONDSTORE, QRESYNC, SORT, THREAD, IDLE, MOVE, NAMESPACE, SPECIAL-USE, LITERAL+, ENABLE, COMPRESS=DEFLATE, LIST-EXTENDED, LIST-STATUS, WITHIN, QUOTA, METADATA.
 * 📫 **IMAP Client** — full client-mode `IMAPSession` with LOGIN / XOAUTH2, FETCH, SEARCH, STORE, COPY, MOVE, IDLE, LIST-EXTENDED, QUOTA, METADATA, COMPRESS.
 * 📭 **POP3 Server** — RFC 1939 + RFC 2449 CAPA, UIDL, TOP, STLS, SASL, XOAUTH2. Same `mailboxSession` event model as IMAP.
@@ -42,7 +42,7 @@
 
 ### Message handling
 
-* 📦 **MIME compose & parse** — text, HTML, attachments, inline images, UTF-8 — cross-compatible with nodemailer / mailparser.
+* 📦 **MIME compose & parse** — text, HTML, attachments, inline images. Parses any real-world charset (UTF-8, ISO-8859-*, windows-125x, Shift_JIS, EUC-KR, GB18030, Big5, KOI8-R…) with zero extra dependencies, plus RFC 2047 encoded-words and RFC 2231 extended/continued parameters — cross-compatible with nodemailer / mailparser.
 * 🌍 **SMTPUTF8 + IDN (RFC 6531 + 5890)** — international addresses with automatic Punycode fallback when the peer doesn't support UTF-8.
 * 📣 **DSN (RFC 3461/3464)** — parse NOTIFY / ORCPT / RET / ENVID; generate multipart/report delivery status notifications; `server.sendDsn()` API.
 * 🏷 **Clean flag names** — use `'Seen'` not `'\\Seen'` — the library handles the protocol details.
@@ -55,7 +55,7 @@
 * 🏗 **Domain management** — `buildDomainMailMaterial()` auto-generates DKIM keys and every DNS record you need (DKIM, SPF, DMARC, MX, MTA-STS, TLS-RPT).
 * 🔒 **Multi-domain TLS** — SNI context caching with `server.clearTlsCache()` for Let's Encrypt rotation.
 * 🎯 **Listener-gated capabilities** — advanced extensions (MOVE, QUOTA, METADATA) are advertised only when you wire up their handlers, so clients never attempt something that would return NO.
-* ⚡ **Zero dependencies** — only `node:` builtins and the tiny `flat-ranges` library.
+* ⚡ **Nearly dependency-free** — only `node:` builtins plus one tiny dependency (`flat-ranges`, used for efficient IMAP sequence-set math).
 
 
 ## 📦 Installation
@@ -427,6 +427,17 @@ email-server is a protocol-layer library. It parses wire formats, enforces RFC b
 
 The examples throughout this document use handlers like `db.messages.save(...)` — that's your code, not the library's.
 
+**This extends to attachments and message bytes.** Unlike some send-only libraries that accept a file `path` or a remote `href` and do the reading/downloading for you, email-server never touches the filesystem or network on your behalf for content. You read the bytes however you like — `fs`, an S3 stream you drain yourself, a database blob, a generated buffer — and hand the library a `content` value:
+
+```js
+attachments: [
+  { filename: 'report.pdf', content: fs.readFileSync('/tmp/report.pdf') },
+  { filename: 'logo.png',   content: pngBuffer, cid: 'logo' }   // inline image
+]
+```
+
+This is deliberate: the library stays a pure protocol layer, so *you* keep full control over where content lives, how it's cached, and how I/O errors and timeouts are handled — decisions a mail library shouldn't make for you. It composes the MIME correctly; the sourcing is yours.
+
 ### Listener-gated capabilities — advertise only what you implement
 
 Advanced IMAP extensions are expensive to half-implement. MOVE, QUOTA, and METADATA are therefore advertised only when your code has registered the corresponding handler. If your backend doesn't do quotas, the client never sees QUOTA in the CAPABILITY list and never attempts `GETQUOTAROOT`. When you later add `session.on('quota', ...)`, the capability automatically appears.
@@ -446,12 +457,18 @@ When your backend changes — new message arrives, flags change, a message is ex
 ```js
 session.notifyExists(newTotalCount);      // * n EXISTS
 session.notifyRecent(newRecentCount);     // * n RECENT
-session.notifyExpunge(seqNum);            // * n EXPUNGE
-session.notifyVanished(uid);              // * VANISHED uid      (QRESYNC)
-session.notifyFlags(seqNum, uid, flags);  // * n FETCH (FLAGS ...)
+session.notifyExpunge(seq, uid);          // * n EXPUNGE  (or * VANISHED uid when QRESYNC enabled)
+session.notifyVanished(arg);              // * VANISHED ...  (arg = [uids] | {ranges} | {uids})
+session.notifyFlags(seq, uid, flags);     // * n FETCH (FLAGS ...)
 ```
 
-The library handles the IDLE state — if the client isn't in IDLE, notifications are buffered and flushed on the next SELECT/EXAMINE; if the client is in IDLE, they're pushed immediately.
+These emit untagged responses **only while the session has the relevant folder open (SELECTED state)** — whether or not the client is currently in an IDLE command. Outside SELECTED they are no-ops; the library does not buffer them for a later SELECT. To push a change to every session viewing a folder, walk the live sessions:
+
+```js
+server.forEachMailboxSession(s => {
+  if (s.username === user && s.currentFolder === 'INBOX') s.notifyExists(newTotal);
+});
+```
 
 
 ## 📚 API Reference
@@ -477,6 +494,7 @@ import {
 
   // DSN (RFC 3461/3464)
   buildDsn,                    // Build a multipart/report DSN message
+  parseDsn,                    // Parse an incoming bounce (DSN) into structured data
 
   // DKIM / SPF / DMARC (standalone auth checks)
   dkimSign, dkimVerify,
@@ -511,10 +529,16 @@ import {
 | `pool` | object | defaults | Connection pool settings — see below |
 | `useProxy` | boolean | false | Enable HAProxy PROXY protocol v1 |
 | `closeTimeout` | number | 30000 | Graceful shutdown timeout (ms) |
+| `addReceived` | boolean | true | Prepend a `Received:` trace header to every inbound message (RFC 5321 §4.4) |
+| `maxReceivedHops` | number | 100 | Reject a message carrying at least this many `Received:` headers as a mail loop (RFC 5321 §6.3); `0` disables |
+| `handlerTimeout` | number | 0 (off) | Watchdog: if a storage handler never calls its callback, answer `NO`/`-ERR` after this many ms instead of hanging the client. Fires a `handlerTimeout` event |
+| `maxAppendSize` | number | 0 (none) | IMAP `APPENDLIMIT` (RFC 7889): reject `APPEND` larger than this with `NO [TOOBIG]` before accepting the bytes |
+| `metadataMaxSize` | number | 2 KB | Max METADATA annotation value size (RFC 5464) |
 | `SNICallback` | function | null | `(servername, cb)` for dynamic TLS |
 | `dkimCallback` | function | null | `(domain, cb)` for dynamic DKIM |
 | `onSecure` | function | null | Post-TLS handshake callback |
-| `rateLimit` | object | null | `{ perMinute, perHour, banDuration }` inbound rate limiting |
+
+> **Note on rate limiting:** per-IP connection/auth rate limiting is not built into this version — it needs a dedicated design (per-IP vs per-user, shared state across workers). Enforce limits at your firewall / reverse proxy, or in your `connection` / `auth` handlers, for now.
 
 #### Pool options
 
@@ -534,6 +558,11 @@ import {
 | `auth` | `(info)` | Authentication request — unified across SMTP, IMAP, POP3 |
 | `smtpSession` | `(session)` | SMTP session ready (both inbound and submission) |
 | `mailboxSession` | `(session)` | IMAP or POP3 session ready |
+| `loop` | `(info)` | Inbound message refused as a mail loop — `info.hops`, `info.remoteAddress`, `info.from`, `info.to` |
+| `sending` | `(options)` | Outbound message about to be dispatched via `server.send()` |
+| `sent` | `(info)` | Outbound message accepted by the remote MX |
+| `bounce` | `(info)` | Outbound message permanently failed (all retries exhausted) |
+| `retry` | `(info)` | Outbound message temporarily failed and will be retried |
 | `error` | `(err)` | Server-level error |
 | `close` | — | Server fully closed |
 
@@ -548,9 +577,9 @@ import {
 | `server.sendDsn(options, cb)` | Dispatch a DSN message with null return-path |
 | `server.buildDsn(options)` | Build a DSN message (Buffer) without sending |
 | `server.clearTlsCache(servername?)` | Clear SNI cache (use after cert rotation) |
-| `server.forEachMailboxSession(fn)` | Iterate active IMAP/POP3 sessions (for push notifications) |
-| `server.ban(ip, durationMs?)` | Temporarily ban an IP (rate-limit integration) |
-| `server.unban(ip)` | Remove a ban |
+| `server.forEachMailboxSession(fn)` | Iterate every live IMAP/POP3 session (for push notifications) |
+| `server.serializeQueue()` | Snapshot the outbound queue (pending + in-flight) as JSON-safe data |
+| `server.restoreQueue(snapshot)` | Re-ingest a queue snapshot on startup — crash-safe outbound mail |
 
 ### The `auth` event
 
@@ -597,6 +626,44 @@ server.on('smtpSession', session => {
 });
 ```
 
+### The `mailboxSession` event — start with just 6 handlers
+
+The full list below has 24+ events, but **a working IMAP/POP3 mailbox needs only these six.** Everything else is optional — the library detects what you've registered and adapts (unimplemented extensions simply aren't advertised, and if a *required* handler is missing, the client gets a clear `NO No handler registered for 'openFolder'...` instead of a hang).
+
+```js
+server.on('mailboxSession', session => {
+  // 1. What folders exist?
+  session.on('folders', cb =>
+    cb(null, [{ name: 'INBOX' }, { name: 'Sent', specialUse: 'Sent' }]));
+
+  // 2. Open a folder (SELECT): its counters
+  session.on('openFolder', (name, cb) =>
+    cb(null, { total: 12, unread: 3, uidValidity: 1, uidNext: 13 }));
+
+  // 3. Turn a requested range ("1:10", UIDs...) into concrete messages
+  session.on('resolveMessages', (folder, query, cb) =>
+    cb(null, [{ seq: 1, uid: 101 }, { seq: 2, uid: 102 }]));
+
+  // 4. Cheap metadata for message lists
+  session.on('messageMeta', (folder, uids, cb) =>
+    cb(null, uids.map(uid => ({ uid, flags: ['Seen'], size: 2048, internalDate: new Date() }))));
+
+  // 5. The raw message bytes
+  session.on('messageBody', (folder, uid, responder) =>
+    responder.send(loadRawBytes(uid)));       // or responder.stream(...) for large messages
+
+  // 6. Flag changes (read/starred/deleted) — also receives the implicit
+  //    \Seen the library reports when a client fetches a body (query.implicit === true)
+  session.on('setFlags', (folder, query, cb) => { saveFlags(query); cb(null); });
+});
+```
+
+That's a complete, Thunderbird-compatible mailbox. Add `search` when you want server-side search, `append`/`expunge`/`copyMessages` for full manipulation, and the rest only for the extensions you care about.
+
+**Folder names are always clean UTF-8 on your side.** Clients send international folder names in IMAP's modified UTF-7 wire encoding (`&BecF0QXcBdUF6g-`); the library decodes every inbound name and encodes every outbound one, so your handlers see and return `"קבלות"` and never the wire form.
+
+**Missing-folder errors:** in `append`/`copyMessages`/`move`, set `err.tryCreate = true` when the target folder doesn't exist — the library answers `NO [TRYCREATE]` and well-behaved clients auto-create the folder and retry.
+
 ### The `mailboxSession` event — all 24 storage handlers
 
 Your backend implements any subset of these. The library gates features (MOVE, QUOTA, METADATA, THREAD, SORT) on whether the listener is registered.
@@ -638,12 +705,12 @@ Call these on an active `mailboxSession` to deliver real-time notifications to c
 ```js
 session.notifyExists(count)              // → * <count> EXISTS
 session.notifyRecent(count)              // → * <count> RECENT
-session.notifyExpunge(seqNum)            // → * <seqNum> EXPUNGE
-session.notifyVanished(uid)              // → * VANISHED <uid>   (QRESYNC)
-session.notifyFlags(seqNum, uid, flags)  // → * <seqNum> FETCH (UID ... FLAGS (...))
+session.notifyExpunge(seq, uid)          // → * <seq> EXPUNGE  (or * VANISHED <uid> when QRESYNC enabled)
+session.notifyVanished(arg)              // → * VANISHED ...   (arg = [uids] | {ranges} | {uids})
+session.notifyFlags(seq, uid, flags)     // → * <seq> FETCH (UID ... FLAGS (...))
 ```
 
-If the client isn't in IDLE, the library queues notifications and flushes on the next SELECT/EXAMINE. If it is in IDLE, they push immediately.
+These write untagged responses to the client only while the session is in the **SELECTED** state (the folder the notification concerns is open). Outside SELECTED they are no-ops — the library does not buffer them. Use `server.forEachMailboxSession(fn)` to find the sessions that currently have the affected folder open (`s.currentFolder`) and notify those.
 
 ### `sendMail(options, cb)`
 
@@ -880,14 +947,14 @@ When a domain is registered via `server.addDomain(material)`, every outbound mes
 * **STARTTLS + implicit TLS** on every protocol (SMTP 25/587/465, IMAP 143/993, POP3 110/995)
 * **SNI support** — multi-domain on a single port with `SNICallback`
 * **TLS context caching** with `server.clearTlsCache()` for Let's Encrypt rotation
-* **MTA-STS** enforcement — `server.on('secure')` exposes negotiated version/cipher
+* **MTA-STS both directions** — policy generation for your domains, AND sender-side enforcement (RFC 8461): before delivering to a remote domain its policy is fetched and, in `enforce` mode, only policy-matching MXs over fully-validated TLS are used. Opt out per-send with `mtaSts: false`
 * **REQUIRETLS** — refuse to deliver sensitive mail over cleartext
 * **TLS-RPT** — receive daily reports about TLS failures from other MTAs
 
 ### Built-in protections
 
 * **SMTP smuggling protection** (RFC 5321 §4.1.1.4) — bare LF normalization prevents CVE-2023-51764-class attacks
-* **Per-IP rate limiting** — `{ rateLimit: { perMinute, perHour, banDuration } }` in `createServer`
+* **Mail-loop detection** — messages exceeding `maxReceivedHops` `Received:` headers are refused (RFC 5321 §6.3); a `loop` event fires so you can log the offender
 * **Graceful shutdown** — `server.close()` drains sessions with `closeTimeout`
 * **Backpressure handling** — server respects TCP flow control; slow clients don't OOM the process
 * **PROXY protocol v1** — trust the real client IP when behind HAProxy / Nginx
@@ -1000,8 +1067,13 @@ Once you understand the scope, here's how `email-server` fits against popular al
 | SMTP | REQUIRETLS (RFC 8689) |
 | SMTP | DSN (RFC 3461/3464) — parse + generate |
 | SMTP | SMTP smuggling protection, PROXY protocol v1 |
+| SMTP | `Received:` trace headers + mail-loop detection (RFC 5321 §4.4/§6.3) |
+| SMTP | DSN parse (`parseDsn`) — structured incoming-bounce handling |
+| SMTP client | MTA-STS sender-side enforcement (RFC 8461) |
+| IMAP server | APPENDLIMIT / `[TOOBIG]` (RFC 7889) |
+| Architecture | Handler watchdog (`handlerTimeout`) + queue persistence hooks |
 | SMTP client | Direct MX + relay, connection pool with RSET reuse |
-| SMTP client | Retry with backoff, per-domain rate limiting |
+| SMTP client | Retry with backoff, per-domain outbound throttling |
 | SMTP client | IDN Punycode fallback when peer lacks SMTPUTF8 |
 | IMAP server | RFC 3501 full, UIDPLUS, LITERAL+, ENABLE |
 | IMAP server | CONDSTORE, QRESYNC (RFC 7162) |
@@ -1012,6 +1084,8 @@ Once you understand the scope, here's how `email-server` fits against popular al
 | IMAP server | QUOTA (RFC 9208) |
 | IMAP server | METADATA (RFC 5464) |
 | IMAP server | COMPRESS=DEFLATE (RFC 4978) |
+| IMAP server | Modified UTF-7 mailbox names (RFC 3501 §5.1.3) — handlers always see UTF-8 |
+| IMAP server | CHECK, implicit \\Seen on FETCH BODY[], [TRYCREATE] |
 | IMAP client | Full `IMAPSession({isServer:false})` with all extensions |
 | POP3 server | RFC 1939 + CAPA + STLS + SASL + XOAUTH2 |
 | POP3 client | Full `POP3Session({isServer:false})` |
@@ -1020,12 +1094,12 @@ Once you understand the scope, here's how `email-server` fits against popular al
 | Security | MTA-STS (RFC 8461) generation + HTTP handler |
 | Security | TLS-RPT (RFC 8460) generation |
 | Security | Multi-domain TLS with SNI caching |
-| MIME | Compose + parse (nodemailer-compatible) |
+| MIME | Compose + parse — full charset support (ISO-8859-*, windows-125x, CJK), RFC 2047 + RFC 2231 |
 | Architecture | Unified `auth` / `smtpSession` / `mailboxSession` event model |
 | Architecture | Bring-your-own-storage — library never persists messages |
 | Architecture | Listener-gated capabilities — honest CAPABILITY advertising |
 | Tooling | 360 tests, `buildDomainMailMaterial()`, Thunderbird demo |
-| Packaging | Zero dependencies (`node:` builtins + `flat-ranges`) |
+| Packaging | One dependency (`node:` builtins + `flat-ranges`) |
 
 ### ⏳ Planned
 
