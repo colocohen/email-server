@@ -103,7 +103,18 @@ function OutboundPool(options) {
   function cleanPool(domain) {
     let pool = pools[domain];
     if (!pool) return;
-    if (pool.connections.length === 0 && pool.pending.length === 0) {
+    // A pool may only be discarded when it holds NOTHING — including messages
+    // that are currently in flight.
+    //
+    // This ran from closeConnection(), and closing the last connection while a
+    // message was in flight deleted the whole domain pool — taking the message
+    // with it. The message was then neither delivered, nor retried, nor
+    // bounced: its callback never fired and it vanished from serialize(), so
+    // even a queue snapshot could not recover it. Silently losing accepted
+    // mail is the worst failure this library can have.
+    if (pool.connections.length === 0 &&
+        pool.pending.length === 0 &&
+        (!pool.inFlight || pool.inFlight.length === 0)) {
       delete pools[domain];
       dnsCache.remove(domain);
     }
@@ -263,14 +274,32 @@ function OutboundPool(options) {
       // Send all RCPT TO
       let accepted = [];
       let rejected = [];
+      let rcptErrors = [];
       let rcptIdx = 0;
 
       function nextRcpt() {
         if (rcptIdx >= envTo.length) {
           if (accepted.length === 0) {
             entry.busy = false;
-            let error = new Error('All recipients rejected');
-            error.permanent = true;
+            // Whether this is permanent is decided by the SERVER's reply code,
+            // not assumed. Marking every RCPT rejection permanent hard-bounced
+            // mail that the peer had merely deferred — and a 4xx deferral on
+            // RCPT is exactly what GREYLISTING is: the receiver says "come
+            // back in a few minutes" and expects a retry. Treating that as a
+            // bounce loses mail to a large share of the internet on the very
+            // first attempt.
+            //
+            // Permanent only when EVERY rejection was 5xx; if any was 4xx (or
+            // unparseable) the whole delivery is retried, which is the safe
+            // direction — a redundant retry costs a connection, a wrong bounce
+            // costs the message.
+            let allPermanent = rcptErrors.length > 0 && rcptErrors.every(function(e) {
+              let m = /\b([45]\d{2})\b/.exec(e && e.message || '');
+              return !!m && m[1].charAt(0) === '5';
+            });
+            let error = new Error('All recipients rejected' +
+              (rcptErrors.length ? ': ' + rcptErrors[0].message : ''));
+            error.permanent = allPermanent;
             finishMessage(pool, entry, msg, error, null);
             return;
           }
@@ -294,7 +323,7 @@ function OutboundPool(options) {
         }
 
         entry.conn.rcptTo(envTo[rcptIdx], function(err) {
-          if (err) rejected.push(envTo[rcptIdx]);
+          if (err) { rejected.push(envTo[rcptIdx]); rcptErrors.push(err); }
           else accepted.push(envTo[rcptIdx]);
           rcptIdx++;
           nextRcpt();
@@ -324,6 +353,14 @@ function OutboundPool(options) {
         msg.attempts++;
         msg.nextRetry = Date.now() + settings.retryDelays[msg.attempts - 1];
         pool.pending.push(msg);
+        // The scheduler auto-stops when nothing is pending — and while this
+        // message was in flight, `pending` WAS empty, so it may already have
+        // stopped. Re-queuing alone would then leave the message sitting in
+        // the queue with nobody to pick it up: every deferred delivery
+        // (greylisting, "try again later") would be silently abandoned until
+        // the next unrelated enqueue() happened to restart the loop.
+        // startScheduler() is idempotent.
+        startScheduler();
         ev.emit('retry', { id: msg.id, attempts: msg.attempts, error: err.message, nextRetry: msg.nextRetry });
       } else {
         // Permanent failure
@@ -388,12 +425,12 @@ function OutboundPool(options) {
           } else {
             // RSET failed — connection is dead
             closeConnection(pool, entry);
-            pool.pending.unshift(next);
+            requeue(pool, next);
           }
         });
       } catch(e) {
         closeConnection(pool, entry);
-        pool.pending.unshift(next);
+        requeue(pool, next);
       }
     } else {
       // No more messages — idle
@@ -426,6 +463,24 @@ function OutboundPool(options) {
   function doneInFlight(pool, entry) {
     let i = pool.inFlight.indexOf(entry);
     if (i >= 0) pool.inFlight.splice(i, 1);
+  }
+
+  // Put a message back at the head of the queue after the scheduler picked it
+  // up but could not actually hand it to a connection (no connection could be
+  // opened, the reused one turned out to be dead, the per-domain limit was
+  // reached...).
+  //
+  // pickNextMessage MOVED the message from `pending` to `inFlight`, so simply
+  // pushing it back onto `pending` left a second reference behind in
+  // `inFlight`. Every failed scheduling round added another copy: one message
+  // became two, then three. Two consequences, both bad — serialize() wrote a
+  // queue snapshot with phantom duplicates, and once the destination came
+  // back the SAME message was delivered once per copy. Duplicate mail is
+  // worse than delayed mail, so the in-flight reference must be dropped
+  // whenever the message returns to the queue.
+  function requeue(pool, msg) {
+    doneInFlight(pool, msg);
+    pool.pending.unshift(msg);
   }
 
 
@@ -471,33 +526,40 @@ function OutboundPool(options) {
                   sendMessage(pool, idleEntry, msg);
                 } else {
                   closeConnection(pool, idleEntry);
-                  pool.pending.unshift(msg);
+                  requeue(pool, msg);
                 }
               });
             } catch(e) {
               closeConnection(pool, idleEntry);
-              pool.pending.unshift(msg);
+              requeue(pool, msg);
             }
           } else {
             closeConnection(pool, idleEntry);
-            pool.pending.unshift(msg);
+            requeue(pool, msg);
           }
         });
       } else if (canOpenConnection(pool)) {
         openConnection(pool, function(err, entry) {
           if (err) {
-            pool.pending.unshift(msg);
+            requeue(pool, msg);
             return;
           }
           sendMessage(pool, entry, msg);
         });
       } else {
-        pool.pending.unshift(msg);
+        requeue(pool, msg);
       }
     }
 
-    // Auto-stop when nothing pending
-    if (!hasPending && schedulerTimer) {
+    // Auto-stop only when there is nothing left to do at all. A message that
+    // is currently in flight will come back to `pending` if its delivery
+    // fails, so an in-flight message counts as work in progress.
+    let hasInFlight = false;
+    for (let i = 0; i < domains.length; i++) {
+      let p = pools[domains[i]];
+      if (p && p.inFlight && p.inFlight.length > 0) { hasInFlight = true; break; }
+    }
+    if (!hasPending && !hasInFlight && schedulerTimer) {
       stopScheduler();
     }
   }

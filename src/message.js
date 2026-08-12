@@ -2,6 +2,8 @@
 import {
   toU8,
   u8ToStr,
+  u8ToBinStr,
+  binStrToU8,
   hasNonAscii
 } from './utils.js';
 
@@ -274,9 +276,19 @@ function foldHeader(name, value) {
   }
   let line = name + ': ' + value;
   let out = '';
+  let minCut = name.length + 2; // never fold inside "Name: "
   while (line.length > 78) {
+    // RFC 5322 §2.2.3 — folding is ONLY permitted at existing WSP. Cutting a
+    // whitespace-free run at column 78 inserts a space the parser must retain
+    // on unfolding, silently corrupting long subjects/message-ids/references.
     let cut = line.lastIndexOf(' ', 78);
-    if (cut <= name.length + 2) cut = 78;
+    if (cut <= minCut) {
+      // No WSP within the soft limit — try the first WSP beyond it so later
+      // clauses can still fold. None at all → emit the long line as-is
+      // (RFC 5322 §2.1.1 permits up to 998 chars).
+      cut = line.indexOf(' ', 79);
+      if (cut < 0) break;
+    }
     out += line.slice(0, cut) + '\r\n ';
     line = line.slice(cut + 1);
   }
@@ -374,7 +386,33 @@ function buildContentType(type, subtype, params) {
 //  Transfer encoding selection
 // ============================================================
 
+// NUL or a control byte other than TAB/CR/LF disqualifies both 7bit and
+// 8bit (RFC 2045 §2.7-2.8 define them over "data" that excludes NUL and,
+// for 7bit, restricts to CR/LF/HTAB among controls). Such bodies go base64.
+function hasBinaryControl(u8) {
+  for (let i = 0; i < u8.length; i++) {
+    let b = u8[i];
+    if (b === 0x00 || b === 0x7F) return true;
+    if (b < 0x20 && b !== 0x09 && b !== 0x0A && b !== 0x0D) return true;
+  }
+  return false;
+}
+
+// RFC 5322 §2.1.1: every line MUST be <= 998 chars excluding CRLF. A body
+// that violates this can't ship as 7bit/8bit — quoted-printable soft breaks
+// wrap it safely (and keep DKIM stable if any hop would otherwise fold it).
+function hasOverlongLine(u8) {
+  let lineLen = 0;
+  for (let i = 0; i < u8.length; i++) {
+    if (u8[i] === 0x0A || u8[i] === 0x0D) lineLen = 0;
+    else if (++lineLen > 998) return true;
+  }
+  return false;
+}
+
 function chooseTextTE(u8, allow8bit) {
+  if (hasBinaryControl(u8)) return 'base64';
+  if (hasOverlongLine(u8)) return 'quoted-printable';
   if (!hasNonAscii(u8)) return '7bit';
   return allow8bit ? '8bit' : 'quoted-printable';
 }
@@ -382,6 +420,7 @@ function chooseTextTE(u8, allow8bit) {
 function encodeTextPart(u8, allow8bit) {
   let te = chooseTextTE(u8, allow8bit);
   if (te === '7bit' || te === '8bit') return { transfer: te, data: ensureCRLF(u8ToStr(u8)) };
+  if (te === 'base64') return { transfer: 'base64', data: base64Wrap76(base64Encode(u8)) };
   return { transfer: 'quoted-printable', data: qpEncode(u8) };
 }
 
@@ -636,6 +675,9 @@ function composeMessage(options, caps) {
 
   let headerStr = hdr.join('\r\n');
   let full = headerStr + '\r\n\r\n' + rootBody;
+  // RFC 5322 §2.3 — every line, including the last, ends in CRLF. Without
+  // this, strict MTAs reject and byte-level comparisons/dot-stuffing misparse.
+  if (full.slice(-2) !== '\r\n') full += '\r\n';
   let rawU8 = toU8(full);
 
   // SMTP profile
@@ -771,11 +813,26 @@ function parseMessage(rawU8) {
 //  Parse helpers
 // ============================================================
 
+// Split at the blank line, at the BYTE level, and decode each half with the
+// codec that fits it:
+//
+//   head — UTF-8. Header values may legitimately be UTF-8 (RFC 6532
+//          SMTPUTF8), and RFC 2047 encoded-words are ASCII either way.
+//   body — latin1 (byte <-> char-code 1:1), i.e. LOSSLESS.
+//
+// Decoding the body as UTF-8 here was the root of a silent corruption: an
+// ISO-8859-1 or windows-1255 body became U+FFFD before decodeBodyByTE and
+// decodeCharset ever ran, so the library's whole charset layer — the thing
+// that is supposed to turn those bytes into correct text — never saw the
+// real octets. The body stays as octets until the declared charset is known.
 function splitHeadersBody(u8) {
-  let s = u8ToStr(u8);
-  let idx = s.indexOf('\r\n\r\n');
-  if (idx < 0) return { head: s, body: '' };
-  return { head: s.slice(0, idx), body: s.slice(idx + 4) };
+  if (!(u8 instanceof Uint8Array)) u8 = toU8(u8);
+  let idx = -1;
+  for (let i = 0; i + 3 < u8.length; i++) {
+    if (u8[i] === 13 && u8[i + 1] === 10 && u8[i + 2] === 13 && u8[i + 3] === 10) { idx = i; break; }
+  }
+  if (idx < 0) return { head: u8ToStr(u8), body: '' };
+  return { head: u8ToStr(u8.subarray(0, idx)), body: u8ToBinStr(u8.subarray(idx + 4)) };
 }
 
 function parseHeaders(headStr) {
@@ -950,7 +1007,9 @@ function splitMultipart(bodyStr, boundaryStr) {
   }
   if (cur) parts.push(cur);
   for (let j = 0; j < parts.length; j++) {
-    let hnb = splitHeadersBody(toU8(parts[j].raw));
+    // parts[j].raw is a latin1 string (see splitHeadersBody) — convert back
+    // through the same codec so part bodies keep their octets too.
+    let hnb = splitHeadersBody(binStrToU8(parts[j].raw));
     parts[j].headers = parseHeaders(hnb.head);
     parts[j].body = hnb.body;
   }
@@ -961,7 +1020,10 @@ function decodeBodyByTE(bodyStr, te) {
   te = te || '7bit';
   if (te === 'base64') return base64Decode(bodyStr);
   if (te === 'quoted-printable') return qpDecode(bodyStr);
-  return toU8(bodyStr);
+  // 7bit / 8bit / binary: the string came from splitHeadersBody in latin1
+  // form, so binStrToU8 recovers the original octets exactly. toU8 would
+  // UTF-8-ENCODE it, turning every byte >= 0x80 into two.
+  return binStrToU8(bodyStr);
 }
 
 

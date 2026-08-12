@@ -12,6 +12,7 @@ import { sendMail } from './smtp_client.js';
 import { OutboundPool } from './pool.js';
 import { buildDsn } from './dsn.js';
 import { prependReceived, countReceivedHops } from './received.js';
+import { prependAuthResults } from './auth_results.js';
 import { composeMessage, parseMessage as parseMessageFn } from './message.js';
 import { sign as dkimSign, verify as dkimVerify } from './dkim.js';
 import { checkSPF } from './spf.js';
@@ -46,6 +47,10 @@ function Server(options) {
     //                   Received: headers, indicating a routing loop
     //                   (default 100, the long-standing convention). 0 disables.
     addReceived:     options.addReceived !== false,
+    // Authentication-Results (RFC 8601) — stamp SPF/DKIM/DMARC/iprev verdicts
+    // onto inbound messages. On by default, as every boundary MTA does this;
+    // set false if something upstream of you already adds the header.
+    addAuthResults:  options.addAuthResults !== false,
     maxReceivedHops: options.maxReceivedHops != null ? options.maxReceivedHops : 100,
 
     // Handler watchdog + APPEND size ceiling — passed through to sessions.
@@ -56,6 +61,27 @@ function Server(options) {
     // PROXY protocol (HAProxy)
     useProxy: options.useProxy || false,
 
+    // Cross-session IDLE notifications (RFC 2177).
+    //
+    // A client sitting in IDLE on INBOX only learns about a change made by
+    // ANOTHER session if someone pushes an untagged response to it. By
+    // default that is the developer's job:
+    //
+    //   server.forEachMailboxSession(s => {
+    //     if (s.username === user && s.currentFolder === folder) s.notifyExists(n);
+    //   });
+    //
+    // Set autoNotify:true and the library does that fan-out itself whenever
+    // an `append` / `setFlags` / `expunge` handler reports success, matching
+    // sessions by username + currentFolder.
+    //
+    // Why this is OPT-IN rather than the default: a developer who already
+    // broadcasts manually (the only way it worked until now) would get every
+    // notification twice. Doubled EXISTS in particular makes clients believe
+    // messages arrived that don't exist. Opting in is a deliberate act of
+    // "I am not broadcasting myself", so the two can't collide.
+    autoNotify: options.autoNotify === true,
+
     // Relay / smarthost
     relay: options.relay || null,
 
@@ -63,6 +89,20 @@ function Server(options) {
     SNICallback: options.SNICallback || null,
     dkimCallback: options.dkimCallback || null,
     onSecure: options.onSecure || null,
+
+    // Server-wide TLS material — the domain-independent fallback.
+    //
+    // Certificates were previously reachable ONLY through a registered
+    // domain's material:
+    //     buildDomainMailMaterial('example.com', { tls: { key, cert } })
+    // which is not where anyone looks first. The natural spelling —
+    // createServer({ tls: { key, cert } }) — was silently ignored, so
+    // STARTTLS went unadvertised and modern senders deferred or rejected
+    // the mail with no clue why. Both spellings now work; per-domain
+    // material still wins on an SNI match, this is what answers everything
+    // else. `tlsOptions` is accepted as an alias since that's the other
+    // name people reach for.
+    tls: options.tls || options.tlsOptions || null,
 
     // Domain registry
     domains: {},
@@ -191,7 +231,77 @@ function Server(options) {
       return context.SNICallback(servername, cb);
     }
 
+    // Last resort: a DEFAULT certificate. Returning null here aborts the TLS
+    // handshake, and after STARTTLS there is no way back — the client already
+    // committed, so the connection dies instead of falling back to plaintext.
+    // That happens for every peer that sends no SNI at all: clients connecting
+    // to a bare IP (SNI can't carry an IP literal) and MTAs that don't send
+    // SNI outbound (Postfix only gained smtp_tls_servername in 3.4, and it is
+    // still not enabled in many deployments). We advertised STARTTLS, so we
+    // must be able to complete it. Any registered domain cert is better than
+    // a dead connection — a hostname mismatch is at worst an unauthenticated
+    // (opportunistic) TLS session, which is exactly what those peers expect.
+    // Preference order: our own hostname, then the first domain with TLS.
+    let fallback = getDefaultTlsMaterial();
+    if (fallback) {
+      try {
+        let ctx = tls.createSecureContext({
+          key: fallback.key,
+          cert: fallback.cert,
+          ca: fallback.ca || undefined
+        });
+        context.secureContexts.set(key, ctx);
+        return cb(null, ctx);
+      } catch(e) {
+        return cb(e);
+      }
+    }
+
     cb(null, null);
+  }
+
+  // Pick the certificate to serve when SNI is absent or matches no registered
+  // domain. Prefers the server's own hostname (the name an MX lookup yields),
+  // falling back to the first registered domain that carries TLS material.
+  function getDefaultTlsMaterial() {
+    let own = context.domains[context.hostname];
+    if (own && own.tls && own.tls.key && own.tls.cert) return own.tls;
+    for (let d in context.domains) {
+      if (!Object.prototype.hasOwnProperty.call(context.domains, d)) continue;
+      let m = context.domains[d];
+      if (m && m.tls && m.tls.key && m.tls.cert) return m.tls;
+    }
+    // Server-wide material (createServer({ tls: {...} })) — the fallback for
+    // operators who run one cert for the whole server rather than per domain.
+    if (context.tls && context.tls.key && context.tls.cert) return context.tls;
+    return null;
+  }
+
+  // Is ANY TLS material reachable? Drives STARTTLS advertisement.
+  function hasAnyTlsMaterial() {
+    return !!(getDefaultTlsMaterial() || context.SNICallback);
+  }
+
+  // Build the TLS options for a server-side handshake. Used by BOTH the
+  // implicit-TLS listeners and every STARTTLS upgrade, so the two paths can't
+  // drift apart.
+  //
+  // The default key/cert matter as much as the SNICallback: Node only invokes
+  // SNICallback when the client actually sends a server_name extension. A peer
+  // connecting to a bare IP cannot send one (SNI has no IP literal form), and
+  // plenty of MTAs don't send one at all. Without a default cert those
+  // handshakes fail outright — and since STARTTLS was already accepted, the
+  // connection is dead rather than falling back to plaintext.
+  function buildServerTlsOptions(extra) {
+    let opts = extra || {};
+    opts.SNICallback = function(servername, cb) { resolveTlsContext(servername, cb); };
+    let def = getDefaultTlsMaterial();
+    if (def) {
+      opts.key  = def.key;
+      opts.cert = def.cert;
+      if (def.ca) opts.ca = def.ca;
+    }
+    return opts;
   }
 
 
@@ -224,9 +334,7 @@ function Server(options) {
   function createSession(socket, isSubmission, remoteAddress, connId) {
 
     // Determine if we have TLS options available
-    let hasTls = Object.keys(context.domains).some(function(d) {
-      return context.domains[d].tls && context.domains[d].tls.key;
-    }) || !!context.SNICallback;
+    let hasTls = hasAnyTlsMaterial();
 
     let session = new SMTPSession({
       hostname: context.hostname,
@@ -246,6 +354,13 @@ function Server(options) {
       return parseMessageFn(raw);
     });
 
+    // The raw-socket read path. Kept in a named variable (and registered
+    // here rather than by the caller) so the STARTTLS handler below can
+    // remove it on upgrade — once the TLSSocket owns the connection this
+    // listener would otherwise keep handing the session encrypted bytes.
+    let rawDataHandler = function(chunk) { session.feed(chunk); };
+    socket.on('data', rawDataHandler);
+
     // Build the session facade — mirrors the IMAP/POP3 mailboxSession pattern.
     // Developer registers per-session handlers (currently just 'mail' and 'close')
     // and accesses auth / transport info through closure.
@@ -256,14 +371,24 @@ function Server(options) {
     sessionFacade.remoteAddress = remoteAddress;
     sessionFacade.isTLS         = session.isTLS;
 
-    // Wire session output to socket with backpressure
+    // Wire session output to the socket with backpressure.
+    //
+    // `writeSocket` is an indirection, not a constant: after a STARTTLS
+    // upgrade every byte must go through the TLSSocket wrapper. Writing to
+    // the raw TCP socket post-upgrade puts CLEARTEXT on a connection the
+    // client is already decrypting — the client sees garbage
+    // ("wrong version number") and drops the session, and worse, replies
+    // that may contain credentials or message content are transmitted
+    // unencrypted. The STARTTLS handler below reassigns this.
+    let transport = socket;
+
     session.on('send', function(data) {
-      if (!socket.destroyed) {
+      if (!transport.destroyed) {
         try {
-          let ok = socket.write(data);
+          let ok = transport.write(data);
           if (!ok) {
             // Buffer full — pause reading until drained
-            socket.pause();
+            transport.pause();
           }
         } catch(e) {}
       }
@@ -432,9 +557,38 @@ function Server(options) {
           }, function(err, dmarcResult) {
             if (err || !dmarcResult) {
               mail.auth.dmarc = 'none';
+              mail.auth.dmarcApplies = true;   // nothing to sample
             } else {
               mail.auth.dmarc = dmarcResult.result;
               mail.auth.dmarcPolicy = dmarcResult.policy || null;
+              // pct= rollout: dmarcPolicy is what the owner ASKED for,
+              // dmarcApplies says whether this message is inside the sample
+              // they asked you to enforce on. Acting on the policy without
+              // checking `applies` rejects mail the owner wanted delivered.
+              mail.auth.dmarcPct = dmarcResult.pct != null ? dmarcResult.pct : 100;
+              mail.auth.dmarcApplies = dmarcResult.applies !== false;
+            }
+
+            // --- Authentication-Results (RFC 8601) ---
+            // Stamp the verdicts we just computed onto the message so anything
+            // downstream — MDA, spam filter, a human reading raw source — can
+            // see them. Without this they live only on `mail.auth` and vanish
+            // when the handler returns. prependAuthResults also STRIPS any
+            // copy that arrived with the message: an inbound one is
+            // attacker-supplied and trivially forged (§5).
+            if (context.addAuthResults) {
+              mail.raw = prependAuthResults(mail.raw, {
+                authservId: context.hostname,
+                spf:        mail.auth.spf,
+                spfDomain:  spfDomain || null,
+                dkim:       mail.auth.dkim,
+                dkimDomain: mail.auth.dkimDomain || null,
+                dmarc:      mail.auth.dmarc,
+                fromDomain: fromDomain || null,
+                iprev:      mail.auth.rdns,
+                ip:         remoteAddress
+              });
+              mail.size = mail.raw.length;
             }
 
             // Fire 'mail' on session facade — developer has all auth + headers
@@ -466,7 +620,13 @@ function Server(options) {
           if (parts[1]) envelopeDomain = parts[1];
         }
 
-        checkSPF(remoteAddress, envelopeDomain, function(err, result) {
+        // Pass the full MAIL FROM and the client's HELO name so SPF records
+        // that use macros (%{s}, %{l}, %{o}, %{h}) can be evaluated. Without
+        // them those records are looked up literally and never match.
+        checkSPF(remoteAddress, envelopeDomain, {
+          sender: mail.from || null,
+          helo:   session.clientHostname || null
+        }, function(err, result) {
           if (err || !result) {
             mail.auth.spf = 'none';
           } else {
@@ -492,12 +652,7 @@ function Server(options) {
 
     // STARTTLS event
     session.on('starttls', function() {
-      let tlsOpts = {
-        isServer: true,
-        SNICallback: function(servername, cb) {
-          resolveTlsContext(servername, cb);
-        }
-      };
+      let tlsOpts = buildServerTlsOptions({ isServer: true });
 
       let tlsSocket = new tls.TLSSocket(socket, tlsOpts);
 
@@ -505,9 +660,19 @@ function Server(options) {
         session.tlsUpgraded();
         sessionFacade.isTLS = true;
 
-        // Replace data handler
+        // Route BOTH directions through the TLS wrapper. Reads: the raw
+        // 'data' listener installed at connection time is removed first —
+        // otherwise it keeps feeding the session the still-encrypted bytes
+        // alongside tlsSocket's decrypted ones. Writes: point writeSocket at
+        // the TLS layer so replies are actually encrypted.
+        transport = tlsSocket;
+        if (rawDataHandler) socket.removeListener('data', rawDataHandler);
+
         tlsSocket.on('data', function(chunk) {
           session.feed(chunk);
+        });
+        tlsSocket.on('drain', function() {
+          if (!tlsSocket.destroyed) tlsSocket.resume();
         });
       });
 
@@ -580,9 +745,27 @@ function Server(options) {
 
       let session = createSession(socket, isSubmission, finalRemoteAddress, connId);
 
-      socket.on('data', function(chunk) {
-        session.feed(chunk);
+      // The session emits 'error' for protocol-level abuse (e.g. a >16KB
+      // command line with no CRLF — smtp_session guards against buffer
+      // bloat). An EventEmitter 'error' with no listener THROWS, so before
+      // this handler a single unauthenticated client could crash the whole
+      // process (and every open connection) with one TCP packet. Drop the
+      // offending connection and surface the event as 'clientError' (never
+      // 'error' — that would just move the same crash to the server emitter
+      // when the developer hasn't subscribed).
+      session.on('error', function(err) {
+        ev.emit('clientError', {
+          protocol: isSubmission ? 'submission' : 'smtp',
+          remoteAddress: finalRemoteAddress,
+          id: connId,
+          error: err
+        });
+        try { socket.destroy(); } catch(e) {}
+        try { session.close(); } catch(e) {}
       });
+
+      // Note: the socket 'data' listener is registered inside createSession
+      // (it needs to be removable on STARTTLS upgrade).
 
       socket.on('error', function() {
         session.close();
@@ -634,13 +817,32 @@ function Server(options) {
         let remainder = buf.slice(nlIdx + 1);
         if (remainder.length > 0) socket.unshift(remainder);
 
-        let parts = header.split(' ');
+        // PROXY TCP4 <sourceIP> <destIP> <sourcePort> <destPort>
+        //   [0]    [1]      [2]         [3]        [4]         [5]
+        let parts = header.split(/\s+/);
         if (parts[0] !== 'PROXY') {
           return cb(new Error('Invalid PROXY header'));
         }
 
-        // PROXY TCP4 sourceIP destIP sourcePort destPort
-        let sourceIP = parts[1] || null;
+        // "PROXY UNKNOWN" is legal (v1 §2.1) — the proxy could not determine
+        // the origin. Fall back to the socket's own peer address.
+        let proto = (parts[1] || '').toUpperCase();
+        if (proto === 'UNKNOWN') return cb(null, null);
+        if (proto !== 'TCP4' && proto !== 'TCP6') {
+          return cb(new Error('Unsupported PROXY protocol token: ' + parts[1]));
+        }
+
+        // The source address is field [2], NOT [1] — [1] is the protocol
+        // token. Reading [1] handed the literal string "TCP4" downstream as
+        // the client's IP, which then became the address used for the rDNS
+        // lookup, the SPF check, rate limiting and every log line. Worse, the
+        // reverse lookup of "TCP4" throws EINVAL from the DNS layer and took
+        // the whole process down, so any server behind HAProxy crashed on its
+        // first message.
+        let sourceIP = parts[2] || null;
+        if (!sourceIP || !(net.isIPv4(sourceIP) || net.isIPv6(sourceIP))) {
+          return cb(new Error('Malformed PROXY source address: ' + sourceIP));
+        }
         cb(null, sourceIP);
       }
 
@@ -707,9 +909,7 @@ function Server(options) {
     }
     context.connections.set(socket, { id: connId, protocol: 'imap', remoteAddress: remoteAddress });
 
-    let hasTls = Object.keys(context.domains).some(function(d) {
-      return context.domains[d].tls && context.domains[d].tls.key;
-    }) || !!context.SNICallback;
+    let hasTls = hasAnyTlsMaterial();
 
     let imapSession = new IMAPSession({
       hostname:      context.hostname,
@@ -726,17 +926,39 @@ function Server(options) {
     // Wire session output → socket (with backpressure). The sendFn indirection
     // lets us hot-swap the write path later (for COMPRESS=DEFLATE — after
     // activation the bytes are run through a zlib deflate stream first).
+    // `transport` is the stream the bytes actually leave on: the raw TCP
+    // socket, or the TLSSocket wrapper once STARTTLS completes. Writing to
+    // the raw socket after an upgrade emits CLEARTEXT into an encrypted
+    // session — the client rejects it as a protocol error, and any reply
+    // carrying credentials or message data would go out unencrypted.
+    let transport = socket;
     let sendFn = function(data) {
-      if (!socket.destroyed) {
+      if (!transport.destroyed) {
         try {
-          let ok = socket.write(data);
-          if (!ok) socket.pause();
+          let ok = transport.write(data);
+          if (!ok) transport.pause();
         } catch(e) {}
       }
     };
     imapSession.on('send', function(data) { sendFn(data); });
     socket.on('drain', function() {
       if (!socket.destroyed) socket.resume();
+    });
+
+    // The session's per-command watchdog (options.handlerTimeout) fires
+    // 'handlerTimeout' on the SESSION emitter when a developer storage
+    // handler never calls back. Forward it to the server emitter — that's
+    // where developers listen (srv.on('handlerTimeout')); without this
+    // relay the event fired into the void and hung handlers were invisible.
+    imapSession.on('handlerTimeout', function(info) {
+      ev.emit('handlerTimeout', {
+        protocol: 'imap',
+        remoteAddress: remoteAddress,
+        id: connId,
+        tag: info && info.tag,
+        command: info && info.command,
+        timeout: info && info.timeout
+      });
     });
 
     // --- AUTH ---
@@ -801,6 +1023,7 @@ function Server(options) {
           context.mailboxSessions.add(sessionFacade);
           imapSession.on('close', function() { context.mailboxSessions.delete(sessionFacade); });
           ev.emit('mailboxSession', sessionFacade);
+          if (context.autoNotify) wireAutoNotify(sessionFacade, authCtx);
         },
 
         reject: function(msg) {
@@ -817,16 +1040,20 @@ function Server(options) {
 
     // --- STARTTLS ---
     imapSession.on('starttls', function() {
-      let tlsOpts = {
-        isServer: true,
-        SNICallback: function(servername, cb) {
-          resolveTlsContext(servername, cb);
-        }
-      };
+      let tlsOpts = buildServerTlsOptions({ isServer: true });
       let tlsSocket = new tls.TLSSocket(socket, tlsOpts);
       tlsSocket.on('secure', function() {
         imapSession.tlsUpgraded && imapSession.tlsUpgraded();
-        tlsSocket.on('data', function(chunk) { imapSession.feed(chunk); });
+        // Swap BOTH directions onto the TLS wrapper (see `transport` above).
+        // Reads go through feedFn — not imapSession.feed directly — so a
+        // later COMPRESS=DEFLATE over this TLS session still slips its
+        // inflate stream into the same pipeline.
+        transport = tlsSocket;
+        socket.removeListener('data', rawDataHandler);
+        tlsSocket.on('data', function(chunk) { feedFn(chunk); });
+        tlsSocket.on('drain', function() {
+          if (!tlsSocket.destroyed) tlsSocket.resume();
+        });
       });
       tlsSocket.on('error', function() {
         ev.emit('tlsError', new Error('TLS handshake failed'));
@@ -842,7 +1069,10 @@ function Server(options) {
     // Feed socket data into session. The feedFn indirection lets us slip a
     // zlib inflate stream in place after COMPRESS=DEFLATE is activated.
     let feedFn = function(chunk) { imapSession.feed(chunk); };
-    socket.on('data', function(chunk) { feedFn(chunk); });
+    // Named so the STARTTLS handler can detach it — after the upgrade the
+    // raw socket carries ciphertext, which must not reach the parser.
+    let rawDataHandler = function(chunk) { feedFn(chunk); };
+    socket.on('data', rawDataHandler);
 
     // --- COMPRESS=DEFLATE (RFC 4978) ---
     // Session emits this after sending tagged OK for the COMPRESS command.
@@ -856,8 +1086,8 @@ function Server(options) {
       inflate.on('data',  function(chunk) { imapSession.feed(chunk); });
       inflate.on('error', function() { try { socket.destroy(); } catch(e) {} });
       deflate.on('data',  function(chunk) {
-        if (socket.destroyed) return;
-        try { socket.write(chunk); } catch(e) {}
+        if (transport.destroyed) return;
+        try { transport.write(chunk); } catch(e) {}
       });
       deflate.on('error', function() { try { socket.destroy(); } catch(e) {} });
 
@@ -917,9 +1147,7 @@ function Server(options) {
     }
     context.connections.set(socket, { id: connId, protocol: 'pop3', remoteAddress: remoteAddress });
 
-    let hasTls = Object.keys(context.domains).some(function(d) {
-      return context.domains[d].tls && context.domains[d].tls.key;
-    }) || !!context.SNICallback;
+    let hasTls = hasAnyTlsMaterial();
 
     let pop3Session = new POP3Session({
       hostname:      context.hostname,
@@ -929,17 +1157,32 @@ function Server(options) {
       handlerTimeout: context.handlerTimeout
     });
 
-    // Wire session output → socket (with backpressure)
+    // Wire session output → transport (with backpressure). Same `transport`
+    // indirection as SMTP/IMAP: after STARTTLS the bytes must leave through
+    // the TLSSocket wrapper, not the raw socket.
+    let transport = socket;
     pop3Session.on('send', function(data) {
-      if (!socket.destroyed) {
+      if (!transport.destroyed) {
         try {
-          let ok = socket.write(data);
-          if (!ok) socket.pause();
+          let ok = transport.write(data);
+          if (!ok) transport.pause();
         } catch(e) {}
       }
     });
     socket.on('drain', function() {
       if (!socket.destroyed) socket.resume();
+    });
+
+    // Relay the watchdog event to the server emitter — same rationale as the
+    // IMAP wiring above (developers listen on srv, not on the raw session).
+    pop3Session.on('handlerTimeout', function(info) {
+      ev.emit('handlerTimeout', {
+        protocol: 'pop3',
+        remoteAddress: remoteAddress,
+        id: connId,
+        command: info && info.command,
+        timeout: info && info.timeout
+      });
     });
 
     // --- AUTH ---
@@ -991,18 +1234,22 @@ function Server(options) {
       ev.emit('auth', authInfo);
     });
 
+    let rawDataHandler = function(chunk) { pop3Session.feed(chunk); };
+
     // --- STARTTLS ---
     pop3Session.on('starttls', function() {
-      let tlsOpts = {
-        isServer: true,
-        SNICallback: function(servername, cb) {
-          resolveTlsContext(servername, cb);
-        }
-      };
+      let tlsOpts = buildServerTlsOptions({ isServer: true });
       let tlsSocket = new tls.TLSSocket(socket, tlsOpts);
       tlsSocket.on('secure', function() {
         pop3Session.onTlsUpgraded && pop3Session.onTlsUpgraded();
+        // Swap both directions onto the TLS wrapper and detach the raw
+        // reader, which now only sees ciphertext.
+        transport = tlsSocket;
+        socket.removeListener('data', rawDataHandler);
         tlsSocket.on('data', function(chunk) { pop3Session.feed(chunk); });
+        tlsSocket.on('drain', function() {
+          if (!tlsSocket.destroyed) tlsSocket.resume();
+        });
       });
       tlsSocket.on('error', function() {
         ev.emit('tlsError', new Error('TLS handshake failed'));
@@ -1015,8 +1262,8 @@ function Server(options) {
       try { socket.end(); } catch(e) {}
     });
 
-    // Feed socket data into session
-    socket.on('data', function(chunk) { pop3Session.feed(chunk); });
+    // Feed socket data into session. Named so STARTTLS can detach it.
+    socket.on('data', rawDataHandler);
     socket.on('error', function() { pop3Session.close && pop3Session.close(); });
     socket.on('close', function() {
       pop3Session.close && pop3Session.close();
@@ -1040,6 +1287,26 @@ function Server(options) {
     let pending = 0;
     let errors = [];
 
+    // No TLS material anywhere means STARTTLS is never advertised. That is a
+    // legitimate choice for a local/test server, but on a public MX it is a
+    // deliverability problem worth surfacing rather than leaving to be
+    // discovered from a receiver's bounce logs: Gmail and Microsoft 365 both
+    // prefer TLS-secured delivery and defer or downgrade without it, and any
+    // MTA-STS policy pointing at this host will fail outright. Emitted as a
+    // 'warning' event (never thrown — the server still starts); falls back to
+    // console.warn only when nobody is listening, so it can't go unnoticed.
+    if (!hasAnyTlsMaterial()) {
+      let msg = 'STARTTLS disabled — no TLS certificate configured. ' +
+        'Modern MTAs may defer or reject delivery. Provide one via ' +
+        'createServer({ tls: { key, cert } }) or per-domain via ' +
+        'buildDomainMailMaterial(domain, { tls: { key, cert } }).';
+      if (ev.listenerCount('warning') > 0) {
+        ev.emit('warning', { code: 'NO_TLS', message: msg });
+      } else if (typeof console !== 'undefined' && console.warn) {
+        console.warn('[email-server] ' + msg);
+      }
+    }
+
     function onReady() {
       pending--;
       if (pending === 0) {
@@ -1060,23 +1327,9 @@ function Server(options) {
 
     function startTlsServer(port, onConnection) {
       pending++;
-      let tlsOpts = {
-        SNICallback: function(servername, cb2) {
-          resolveTlsContext(servername, cb2);
-        }
-      };
-
-      // Find a default cert from registered domains
-      let domainNames = Object.keys(context.domains);
-      for (let i = 0; i < domainNames.length; i++) {
-        let mat = context.domains[domainNames[i]];
-        if (mat.tls && mat.tls.key && mat.tls.cert) {
-          tlsOpts.key = mat.tls.key;
-          tlsOpts.cert = mat.tls.cert;
-          if (mat.tls.ca) tlsOpts.ca = mat.tls.ca;
-          break;
-        }
-      }
+      // Same options builder as the STARTTLS upgrades — SNICallback plus a
+      // default cert for peers that send no SNI.
+      let tlsOpts = buildServerTlsOptions({});
 
       let tlsServer = tls.createServer(tlsOpts, function(socket) {
         onConnection(socket);
@@ -1322,6 +1575,74 @@ function Server(options) {
   //  API
   // ============================================================
 
+  // Fan a mailbox change out to every OTHER live session watching the same
+  // user's same folder. Only active when options.autoNotify is set (see the
+  // context field for why it is opt-in). `origin` is excluded: the session
+  // that made the change already learned about it through its own tagged
+  // response, and re-notifying it would duplicate what the client just did.
+  function broadcastToPeers(origin, folder, fn) {
+    context.mailboxSessions.forEach(function(s) {
+      if (s === origin) return;
+      if (s.protocol !== 'imap') return;              // POP3 has no push channel
+      if (s.username !== origin.username) return;
+      if (s.currentFolder !== folder) return;
+      try { fn(s); } catch (e) { ev.emit('error', e); }
+    });
+  }
+
+  // Attach listeners that observe the developer's storage handlers and
+  // broadcast on success. We register on the SAME emitter the developer uses,
+  // so ordering is "developer's handler runs, then ours" — but both receive
+  // the same callback object, and we must not call it. We therefore observe
+  // rather than intercept: we only look at the arguments, never at the
+  // developer's result, and never invoke cb ourselves.
+  function wireAutoNotify(facade, authCtx) {
+    // A new message arrived in a folder → peers watching it need EXISTS.
+    // The new total isn't known here (only the developer's store knows), so
+    // we ask each peer to re-announce its own count; passing undefined makes
+    // notifyExists re-send the session's current total, which the client
+    // treats as a cue to re-sync.
+    authCtx.on('append', function(folder) {
+      setImmediate(function() {
+        broadcastToPeers(facade, folder, function(s) { s.notifyExists(); });
+      });
+    });
+
+    // Flag changes → peers need untagged FETCH with the new flags.
+    // Implicit \Seen (set by a FETCH of the body) is skipped: it is a
+    // side effect of one client reading, not a change others must hear about,
+    // and broadcasting it would flood every idling session on every read.
+    //
+    // An untagged FETCH is addressed by SEQUENCE number, which is why we need
+    // query.seqs. Two sessions with the same mailbox selected and no expunge
+    // between them share the same ordering, so the origin's sequence numbers
+    // are valid for the peer. If a peer's view has drifted (it missed an
+    // expunge), the client resyncs on its next command — the same recovery
+    // path it already uses for any out-of-date sequence view.
+    authCtx.on('setFlags', function(folder, query) {
+      if (!query || query.implicit || !query.uids || !query.seqs) return;
+      setImmediate(function() {
+        broadcastToPeers(facade, folder, function(s) {
+          for (let i = 0; i < query.uids.length; i++) {
+            if (typeof query.seqs[i] !== 'number') continue;
+            s.notifyFlags(query.seqs[i], query.uids[i], query.flags);
+          }
+        });
+      });
+    });
+
+    // Deletions → peers need EXPUNGE / VANISHED. We don't know the sequence
+    // numbers in the peer's view (they differ per session), so we nudge the
+    // peer to re-announce its total; QRESYNC-capable clients will follow up
+    // with a resync.
+    authCtx.on('expunge', function(folder) {
+      setImmediate(function() {
+        broadcastToPeers(facade, folder, function(s) { s.notifyExists(); });
+      });
+    });
+  }
+
+
   let api = {
     context: context,
 
@@ -1371,7 +1692,7 @@ function Server(options) {
     serializeQueue: function() { return context.pool.serialize(); },
     restoreQueue: function(snapshot) { return context.pool.restore(snapshot); },
 
-    // Iterate every live IMAP/POP3 mailbox session. The developer uses this
+  // Iterate every live IMAP/POP3 mailbox session. The developer uses this
     // to fan a change out to all connected sessions for a user — e.g. when a
     // new message lands, walk the sessions, match the ones whose username +
     // currentFolder are affected, and call notifyExists() on them. The library

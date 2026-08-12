@@ -505,24 +505,61 @@ function parseDATAframe(u8) {
   return { type: 'DATA', body: out.slice(0, w) };
 }
 
+// Parse one BDAT frame: the command line, then exactly <size> raw octets.
+//
+//   BDAT <size> [LAST]<CRLF><size octets>
+//
+// Unlike DATA there is no dot-stuffing and no terminating ".": the octet
+// count alone delimits the chunk, which is what makes CHUNKING safe for
+// binary payloads.
 function parseBDATframe(u8) {
   let headerEnd = findBdatHeaderEnd(u8);
-  if (headerEnd < 4) return { type: 'BDAT', error: 'SYNTAX' };
-  let headerStr = u8ToStr(u8.slice(0, headerEnd));
+  // -1 = no CRLF yet: the command line is still arriving. That is NOT a
+  // syntax error, it just means "call me again with more bytes".
+  if (headerEnd === -1) return { type: 'BDAT', incomplete: true, needMore: true };
+  if (headerEnd < 6) return { type: 'BDAT', error: 'SYNTAX' };
+
+  // headerEnd points PAST the CRLF; strip it before matching.
+  let headerStr = u8ToStr(u8.slice(0, headerEnd - 2));
   let m = /^BDAT[\t ]+(\d+)(?:[\t ]+LAST)?$/i.exec(headerStr);
   if (!m) return { type: 'BDAT', error: 'SYNTAX' };
-  let size = parseInt(m[1], 10) || 0;
+  let size = parseInt(m[1], 10);
+  if (!isFinite(size) || size < 0) return { type: 'BDAT', error: 'SYNTAX' };
   let hasLast = /\bLAST\b/i.test(headerStr);
-  let payload = u8.slice(headerEnd);
-  if (payload.length !== size) return { type: 'BDAT', error: 'SIZE_MISMATCH', declared: size, got: payload.length };
-  return { type: 'BDAT', size: size, last: hasLast, chunk: payload };
+
+  let available = u8.length - headerEnd;
+  // Fewer bytes than declared → the chunk is still in flight. Reporting this
+  // as an error made any chunk split across TCP packets (i.e. any chunk over
+  // ~1.4 KB) look like a protocol violation.
+  if (available < size) {
+    return { type: 'BDAT', incomplete: true, needMore: true, declared: size, got: available };
+  }
+
+  // More bytes than declared is normal with PIPELINING — the surplus is the
+  // NEXT command. Take exactly `size` and tell the caller where we stopped.
+  return {
+    type: 'BDAT',
+    size: size,
+    last: hasLast,
+    chunk: u8.slice(headerEnd, headerEnd + size),
+    end: headerEnd + size
+  };
 }
 
+// Return the offset just PAST the CRLF that ends the BDAT command line, or
+// -1 when that CRLF has not arrived yet.
+//
+// This previously returned the length of the matched command text WITHOUT the
+// CRLF, so the payload slice began two bytes early: every chunk carried a
+// stray leading "\r\n" and every length check therefore failed. The
+// line-based path used by the session (parseBdatHeaderLine) was unaffected,
+// which is why end-to-end BDAT worked while this exported parser did not.
 function findBdatHeaderEnd(u8) {
   let n = Math.min(u8.length, 256);
-  let s = u8ToStr(u8.slice(0, n));
-  let m = /^BDAT[\t ]+\d+(?:[\t ]+LAST)?/i.exec(s);
-  return m ? m[0].length : -1;
+  for (let i = 0; i + 1 < n; i++) {
+    if (u8[i] === 13 && u8[i + 1] === 10) return i + 2;
+  }
+  return -1;
 }
 
 function parseBdatHeaderLine(lineStr) {

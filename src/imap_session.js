@@ -11,6 +11,7 @@ import {
   buildCommandRaw,
   makeTagGenerator,
   serializeValue,
+  quoteString,
   PARSE,
   RESP,
   TOK
@@ -185,6 +186,12 @@ function IMAPSession(options) {
     currentFolderReadOnly:     false,
     currentFolderUidValidity:  null,
     currentFolderTotal:        0,
+
+    // RFC 5182 — the result set saved by SEARCH RETURN (SAVE), referenced as
+    // "$" by later commands. Shape: {uids: number[], byUid: bool}. Scoped to
+    // the selected mailbox: cleared on SELECT/EXAMINE/CLOSE/UNSELECT, since a
+    // set of UIDs is meaningless against a different folder.
+    savedSearchResult:         null,
     currentFolderHighestModseq: 0,   // RFC 7162: tracked per folder
 
     // IDLE state (RFC 2177)
@@ -403,6 +410,9 @@ function IMAPSession(options) {
     caps.push('LIST-STATUS');             // RFC 5819 — STATUS in LIST RETURN
     caps.push('SPECIAL-USE');             // RFC 6154 — \Sent \Drafts \Trash etc.
     caps.push('WITHIN');                  // RFC 5032 — SEARCH YOUNGER/OLDER
+    caps.push('ID');                      // RFC 2971 — client/server identification
+    caps.push('ESEARCH');                 // RFC 4731 — SEARCH RETURN (MIN/MAX/ALL/COUNT)
+    caps.push('SEARCHRES');               // RFC 5182 — saved search result "$"
 
     // MOVE (RFC 6851) is advertised only when the developer has registered a 'move'
     // handler — otherwise the client would try MOVE and get a NO every time. Falling
@@ -602,6 +612,7 @@ function IMAPSession(options) {
       case 'NOOP':         handleNoop(tag);               break;
       case 'LOGOUT':       handleLogout(tag);             break;
       case 'STARTTLS':     handleStartTLS(tag);           break;
+      case 'ID':           handleId(tag, args);           break;  // RFC 2971
       case 'LOGIN':        handleLogin(tag, args);        break;
       case 'AUTHENTICATE': handleAuthenticate(tag, args); break;
 
@@ -692,6 +703,52 @@ function IMAPSession(options) {
     context.state = STATE.LOGOUT;
     // Transport layer should close after receiving this — we emit 'close' too.
     ev.emit('close');
+  }
+
+  // --- ID (RFC 2971) ---
+  // Clients identify themselves right after login: Outlook and Apple Mail
+  // both send it unprompted, and answering BAD (as an unknown command) shows
+  // up as a protocol error in their logs and, for some builds, aborts the
+  // connection. The exchange is purely informational.
+  //
+  //   C: a1 ID ("name" "Outlook" "version" "16.0")
+  //   S: * ID ("name" "email-server")
+  //   S: a1 OK ID completed
+  //
+  // The client's parameter list is surfaced as an 'id' event so the developer
+  // can log which client is connecting. NIL (no parameters) is legal both
+  // ways. What we send back is the developer's response object if they
+  // provide one, else our own name — never anything user-identifying, since
+  // RFC 2971 §3 warns against leaking details that aid fingerprinting.
+  function handleId(tag, args) {
+    let clientParams = null;
+    if (args && args.length > 0 && args[0].type === TOK.LIST) {
+      clientParams = {};
+      let toks = args[0].value;
+      for (let i = 0; i + 1 < toks.length; i += 2) {
+        let k = getStringValue(toks[i]);
+        let v = (toks[i + 1] && toks[i + 1].type === TOK.NIL) ? null : getStringValue(toks[i + 1]);
+        if (k) clientParams[k.toLowerCase()] = v;
+      }
+    }
+
+    let ours = { name: 'email-server' };
+    if (ev.listenerCount('id') > 0) {
+      // Handler may return a replacement object (sync) or mutate nothing.
+      let supplied = null;
+      ev.emit('id', clientParams, function(fields) { supplied = fields; });
+      if (supplied && typeof supplied === 'object') ours = supplied;
+    }
+
+    let parts = [];
+    for (let k in ours) {
+      if (!Object.prototype.hasOwnProperty.call(ours, k)) continue;
+      let v = ours[k];
+      parts.push(quoteString(String(k)));
+      parts.push(v == null ? 'NIL' : quoteString(String(v)));
+    }
+    sendUntagged('ID ' + (parts.length ? '(' + parts.join(' ') + ')' : 'NIL'));
+    sendTagged(tag, 'OK', 'ID completed');
   }
 
   function handleStartTLS(tag) {
@@ -1432,8 +1489,17 @@ function IMAPSession(options) {
   function parseCapsFromString(str) {
     let tokens = str.trim().split(/\s+/);
     context.remoteCaps = {};
+    // Keys are upper-cased because capability names are case-insensitive
+    // (RFC 3501 §9) and internal lookups rely on a single spelling. But the
+    // list handed BACK to the application preserves the server's own casing:
+    // every RFC, every doc and our own advertisement spell it "IMAP4rev1",
+    // so a developer writing caps.includes('IMAP4rev1') would never match an
+    // upper-cased "IMAP4REV1".
+    context.remoteCapsOrder = [];
     for (let i = 0; i < tokens.length; i++) {
-      if (tokens[i]) context.remoteCaps[tokens[i].toUpperCase()] = true;
+      if (!tokens[i]) continue;
+      context.remoteCaps[tokens[i].toUpperCase()] = true;
+      context.remoteCapsOrder.push(tokens[i]);
     }
   }
 
@@ -1492,9 +1558,13 @@ function IMAPSession(options) {
     clientSend('CAPABILITY', [], function(err, info) {
       if (err) return cb && cb(err);
       if (info.status !== 'OK') return cb && cb(new Error('CAPABILITY failed: ' + info.text));
-      // context.remoteCaps is a map {CAP: true}; expose as sorted array for the API
-      let list = context.remoteCaps ? Object.keys(context.remoteCaps).sort() : [];
-      if (cb) cb(null, { capabilities: list });
+      // Expose the capabilities as the server spelled them (see
+      // parseCapsFromString); fall back to the normalized keys if we only
+      // ever saw them through a response code.
+      let list = context.remoteCapsOrder && context.remoteCapsOrder.length
+        ? context.remoteCapsOrder.slice()
+        : (context.remoteCaps ? Object.keys(context.remoteCaps).sort() : []);
+      if (cb) cb(null, withAlias(list, 'capabilities'));
     });
   }
 
@@ -1622,6 +1692,7 @@ function IMAPSession(options) {
   //
   // Use '' as the mailbox for server-wide annotations.
   function clientGetMetadata(mailbox, paths, cb) {
+    mailbox = mbox(mailbox);
     if (!Array.isArray(paths)) paths = [paths];
     let args = [
       { type: TOK.QUOTED, value: String(mailbox == null ? '' : mailbox) },
@@ -1656,6 +1727,7 @@ function IMAPSession(options) {
   }
 
   function clientSetMetadata(mailbox, entries, cb) {
+    mailbox = mbox(mailbox);
     let pairs = [];
     let keys = Object.keys(entries);
     for (let i = 0; i < keys.length; i++) {
@@ -1851,9 +1923,15 @@ function IMAPSession(options) {
       delimiter = String(delimTok.value || '');
     }
 
+    // The wire carries modified UTF-7 (RFC 3501 §5.1.3): "קבלות" arrives as
+    // "&BecF0QXcBdUF6g-". The SERVER side decodes inbound names (getMailboxName),
+    // but the client did not decode the names it RECEIVES — so folder lists came
+    // back in wire form and no application could match them against the names it
+    // had sent. Both directions now go through the same codec.
     let name;
     if (nameTok && nameTok.type === TOK.LITERAL) name = u8ToStr(nameTok.value);
     else name = String(nameTok ? (nameTok.value || '') : '');
+    name = mutf7Decode(name);
 
     // Derive specialUse from attributes (for developer convenience)
     let specialUse = null;
@@ -1879,7 +1957,10 @@ function IMAPSession(options) {
     let first = resp.data[0];
     if (first.type === TOK.NUMBER && resp.data[1]) {
       let kind = String(resp.data[1].value || '').toUpperCase();
-      if (kind === 'EXISTS') info.exists = first.value;
+      // Expose the count under BOTH names: `exists` matches the wire
+      // response, `total` matches the server-side openFolder contract. One
+      // library should not make the developer remember which side they are on.
+      if (kind === 'EXISTS') { info.exists = first.value; info.total = first.value; }
       else if (kind === 'RECENT') info.recent = first.value;
       return;
     }
@@ -1921,7 +2002,7 @@ function IMAPSession(options) {
 
   // --- Client commands for Phase 2 ---
   function clientList(reference, pattern, cb) {
-    clientSend('LIST', [reference || '', pattern || '*'], function(err, info) {
+    clientSend('LIST', [mbox(reference || ''), mbox(pattern || '*')], function(err, info) {
       if (err) return cb && cb(err);
       if (info.status !== 'OK') return cb && cb(new Error('LIST failed: ' + info.text));
       let folders = [];
@@ -1929,7 +2010,7 @@ function IMAPSession(options) {
         let f = parseListUntagged(info.untagged[i]);
         if (f) folders.push(f);
       }
-      if (cb) cb(null, { folders: folders });
+      if (cb) cb(null, withAlias(folders, 'folders'));
     });
   }
 
@@ -2025,7 +2106,7 @@ function IMAPSession(options) {
   }
 
   function clientLsub(reference, pattern, cb) {
-    clientSend('LSUB', [reference || '', pattern || '*'], function(err, info) {
+    clientSend('LSUB', [mbox(reference || ''), mbox(pattern || '*')], function(err, info) {
       if (err) return cb && cb(err);
       if (info.status !== 'OK') return cb && cb(new Error('LSUB failed: ' + info.text));
       let folders = [];
@@ -2033,8 +2114,44 @@ function IMAPSession(options) {
         let f = parseListUntagged(info.untagged[i]);
         if (f) folders.push(f);
       }
-      if (cb) cb(null, { folders: folders });
+      if (cb) cb(null, withAlias(folders, 'folders'));
     });
+  }
+
+  // Encode an application-supplied (UTF-8) mailbox name for the wire. The
+  // inverse of the decode above; without it a name containing '&' or any
+  // non-ASCII character is sent in a form the server reads back differently.
+  function mbox(name) {
+    return mutf7Encode(String(name == null ? '' : name));
+  }
+
+  // ------------------------------------------------------------
+  //  Dual-shape client results
+  // ------------------------------------------------------------
+  // Several client calls historically returned a WRAPPER object
+  // ({capabilities: [...]}, {folders: [...]}, {numbers: [...]}) while the
+  // published type definitions, the README and every caller's intuition say
+  // "an array". Changing the return type outright would break existing code;
+  // documenting the wrapper would keep a wart forever.
+  //
+  // So we return the ARRAY, and hang the historical property on it pointing
+  // back at itself. Both spellings work:
+  //
+  //     caps.map(...)            ✓   (the natural, documented form)
+  //     caps.capabilities        ✓   (what older code already does)
+  //
+  // The alias is non-enumerable, so JSON.stringify() and for..in still see a
+  // plain array. This is the same "accept/return both shapes" principle the
+  // library already applies to copyMessages, move and search results.
+  function withAlias(arr, alias, extras) {
+    Object.defineProperty(arr, alias, { value: arr, enumerable: false, configurable: true });
+    if (extras) {
+      for (let k in extras) {
+        if (!Object.prototype.hasOwnProperty.call(extras, k)) continue;
+        Object.defineProperty(arr, k, { value: extras[k], enumerable: false, configurable: true });
+      }
+    }
+    return arr;
   }
 
   function clientSelect(name, options, cb) {
@@ -2047,7 +2164,7 @@ function IMAPSession(options) {
   }
 
   function clientDoSelect(cmd, name, options, cb) {
-    let args = [{ type: TOK.ATOM, value: String(name) }];
+    let args = [{ type: TOK.ATOM, value: mbox(name) }];
 
     // Optional parameter list: (CONDSTORE) or (QRESYNC (...))
     if (options) {
@@ -2152,7 +2269,7 @@ function IMAPSession(options) {
   }
 
   function clientCreate(name, cb) {
-    clientSend('CREATE', [name], function(err, info) {
+    clientSend('CREATE', [mbox(name)], function(err, info) {
       if (err) return cb && cb(err);
       if (info.status !== 'OK') return cb && cb(new Error('CREATE failed: ' + info.text));
       if (cb) cb(null, info);
@@ -2160,7 +2277,7 @@ function IMAPSession(options) {
   }
 
   function clientDelete(name, cb) {
-    clientSend('DELETE', [name], function(err, info) {
+    clientSend('DELETE', [mbox(name)], function(err, info) {
       if (err) return cb && cb(err);
       if (info.status !== 'OK') return cb && cb(new Error('DELETE failed: ' + info.text));
       if (cb) cb(null, info);
@@ -2168,7 +2285,7 @@ function IMAPSession(options) {
   }
 
   function clientRename(oldName, newName, cb) {
-    clientSend('RENAME', [oldName, newName], function(err, info) {
+    clientSend('RENAME', [mbox(oldName), mbox(newName)], function(err, info) {
       if (err) return cb && cb(err);
       if (info.status !== 'OK') return cb && cb(new Error('RENAME failed: ' + info.text));
       if (cb) cb(null, info);
@@ -2176,7 +2293,7 @@ function IMAPSession(options) {
   }
 
   function clientSubscribe(name, cb) {
-    clientSend('SUBSCRIBE', [name], function(err, info) {
+    clientSend('SUBSCRIBE', [mbox(name)], function(err, info) {
       if (err) return cb && cb(err);
       if (info.status !== 'OK') return cb && cb(new Error('SUBSCRIBE failed: ' + info.text));
       if (cb) cb(null, info);
@@ -2184,7 +2301,7 @@ function IMAPSession(options) {
   }
 
   function clientUnsubscribe(name, cb) {
-    clientSend('UNSUBSCRIBE', [name], function(err, info) {
+    clientSend('UNSUBSCRIBE', [mbox(name)], function(err, info) {
       if (err) return cb && cb(err);
       if (info.status !== 'OK') return cb && cb(new Error('UNSUBSCRIBE failed: ' + info.text));
       if (cb) cb(null, info);
@@ -2194,7 +2311,7 @@ function IMAPSession(options) {
   function clientStatus(name, items, cb) {
     items = items || ['MESSAGES', 'UIDNEXT', 'UIDVALIDITY', 'UNSEEN'];
     let itemList = items.map(function(s) { return { type: TOK.ATOM, value: String(s).toUpperCase() }; });
-    clientSend('STATUS', [name, { type: TOK.LIST, value: itemList }], function(err, info) {
+    clientSend('STATUS', [mbox(name), { type: TOK.LIST, value: itemList }], function(err, info) {
       if (err) return cb && cb(err);
       if (info.status !== 'OK') return cb && cb(new Error('STATUS failed: ' + info.text));
 
@@ -2503,6 +2620,29 @@ function IMAPSession(options) {
   }
 
   function clientDoStore(byUid, seqSet, mode, flags, options, cb) {
+    // Two calling conventions, told apart without guessing:
+    //
+    //   store(seqSet, 'add',  ['Seen'], cb)     ← current form: mode is a
+    //                                             string, flags an array
+    //   store(seqSet, ['Seen'], '+',    cb)     ← older form documented in
+    //                                             the README: flags first,
+    //                                             then an IMAP operator
+    //
+    // The second argument is an ARRAY in one and a STRING in the other, so
+    // the shapes are unambiguous — no heuristics involved. Supporting both
+    // costs four lines and means code written from the published README
+    // works instead of failing in a way that looks like a server error.
+    if (Array.isArray(mode)) {
+      let realFlags = mode;
+      let opChar = String(flags == null ? '' : flags);
+      mode = opChar === '+' ? 'add' : (opChar === '-' ? 'remove' : 'set');
+      flags = realFlags;
+    }
+    // Also accept the raw IMAP operators in the mode position.
+    if (mode === '+') mode = 'add';
+    else if (mode === '-') mode = 'remove';
+    else if (mode === '') mode = 'set';
+
     // mode: 'set' | 'add' | 'remove'
     let op = 'FLAGS';
     if (mode === 'add') op = '+FLAGS';
@@ -2565,9 +2705,10 @@ function IMAPSession(options) {
 
   function clientDoCopy(byUid, seqSet, dst, options, cb) {
     let cmd  = byUid ? 'UID' : 'COPY';
+    let dstTok = { type: TOK.ATOM, value: mbox(dst) };
     let args = byUid
-      ? [{ type: TOK.ATOM, value: 'COPY' }, { type: TOK.ATOM, value: String(seqSet) }, dst]
-      : [{ type: TOK.ATOM, value: String(seqSet) }, dst];
+      ? [{ type: TOK.ATOM, value: 'COPY' }, { type: TOK.ATOM, value: String(seqSet) }, dstTok]
+      : [{ type: TOK.ATOM, value: String(seqSet) }, dstTok];
     clientSend(cmd, args, function(err, info) {
       if (err) return cb && cb(err);
       if (info.status !== 'OK') return cb && cb(new Error('COPY failed: ' + info.text));
@@ -2670,9 +2811,9 @@ function IMAPSession(options) {
           }
         }
       }
-      let result = { numbers: numbers };
-      if (modseq != null) result.modseq = modseq;
-      if (cb) cb(null, result);
+      // Array of numbers, also reachable as `.numbers` (and `.modseq` when
+      // the server returned one) — see withAlias above.
+      if (cb) cb(null, withAlias(numbers, 'numbers', modseq != null ? { modseq: modseq } : null));
     });
   }
 
@@ -2969,7 +3110,7 @@ function IMAPSession(options) {
     let buf = Buffer.isBuffer(message) ? message : Buffer.from(message, 'utf-8');
 
     // Build the command head up to (and including) the literal marker.
-    let head = String(folder);
+    let head = mbox(folder);
     if (options.flags && options.flags.length) {
       head += ' (' + options.flags.map(serializeFlag).join(' ') + ')';
     }
@@ -3067,7 +3208,7 @@ function IMAPSession(options) {
 
   function clientDoMove(byUid, seqSet, dst, options, cb) {
     let cmd = byUid ? 'UID' : 'MOVE';
-    let dstTok = { type: TOK.ATOM, value: String(dst) };
+    let dstTok = { type: TOK.ATOM, value: mbox(dst) };
     let args = byUid
       ? [{ type: TOK.ATOM, value: 'MOVE' }, { type: TOK.ATOM, value: String(seqSet) }, dstTok]
       : [{ type: TOK.ATOM, value: String(seqSet) }, dstTok];

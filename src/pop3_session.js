@@ -700,12 +700,18 @@ function POP3Session(options) {
         send(dotStuff(bytes));
         sendEnd();
       },
+      // `send` is the name the IMAP responder uses and the one the docs
+      // teach. The same 'messageBody' handler serves both protocols, so it
+      // should not have to remember which one it is answering. Assigned
+      // after the object literal so both names share one `decided` guard.
+      send: null,
       error: function(msg) {
         if (decided) return;
         decided = true;
         sendErr(msg || 'Retrieve failed');
       }
     };
+    responder.send = responder.respond;
     if (ev.listenerCount('messageBody') === 0) {
       sendLine("-ERR no 'messageBody' handler registered on the server");
       return;
@@ -739,12 +745,14 @@ function POP3Session(options) {
         send(dotStuff(sliced));
         sendEnd();
       },
+      send: null,                          // see the RETR responder above
       error: function(msg) {
         if (decided) return;
         decided = true;
         sendErr(msg || 'Retrieve failed');
       }
     };
+    responder.send = responder.respond;
     if (ev.listenerCount('messageBody') === 0) {
       sendLine("-ERR no 'messageBody' handler registered on the server");
       return;
@@ -879,7 +887,11 @@ function POP3Session(options) {
       if (context.state === STATE.GREETING) {
         context.state = STATE.AUTHORIZATION;
         ev.emit('banner', line);
-        // Developer may now issue commands; nothing else to do here.
+        // 'ready' is the event the IMAP and SMTP clients both emit at this
+        // point, and the one the README's POP3 example listens for. Emitting
+        // only 'banner' left that example waiting forever. Both fire, so
+        // existing 'banner' listeners are unaffected.
+        ev.emit('ready', line);
         continue;
       }
 
@@ -970,6 +982,27 @@ function POP3Session(options) {
   // --- Client API methods ---
 
   // USER / PASS — classic plaintext auth.
+  // USER / PASS as separate calls. clientLogin already issues exactly these
+  // two commands internally; exposing them individually costs nothing and
+  // makes the documented two-step form work — it is also how poplib and
+  // Python's poplib are shaped, so it is what people reach for.
+  function clientUser(username, cb) {
+    issueCommand('USER ' + username, 'single', function(err, status) {
+      if (err) { if (cb) cb(err); return; }
+      context.pendingUser = username;
+      if (cb) cb(null, status);
+    });
+  }
+
+  function clientPass(password, cb) {
+    issueCommand('PASS ' + password, 'single', function(err, status) {
+      if (err) { if (cb) cb(err); return; }
+      context.authenticated = true;
+      context.username = context.pendingUser || context.username;
+      if (cb) cb(null, status);
+    });
+  }
+
   function clientLogin(username, password, cb) {
     issueCommand('USER ' + username, 'single', function(err) {
       if (err) { cb(err); return; }
@@ -1171,6 +1204,8 @@ function POP3Session(options) {
 
     // Client commands (no-ops in server mode)
     login:     clientLogin,
+    user:      clientUser,
+    pass:      clientPass,
     xoauth2:   clientXoauth2,
     capa:      clientCapa,
     stat:      clientStat,

@@ -14,6 +14,25 @@ function u8ToStr(u8) {
   return TD.decode(u8 || new Uint8Array(0));
 }
 
+// ------------------------------------------------------------
+//  Byte-preserving (latin1) string codec
+// ------------------------------------------------------------
+// u8ToStr above decodes UTF-8: any byte sequence that is not valid UTF-8
+// (e.g. a Latin-1 0xE9) is silently replaced with U+FFFD, destroying the
+// original octets. That is correct for *display* but must NEVER be used on
+// wire content whose bytes matter (DKIM canonicalization/hashing, raw
+// message relaying). These two helpers map byte <-> char-code 1:1
+// (latin1), so decode+encode is a lossless roundtrip for ANY byte value.
+// ASCII content is identical under both codecs.
+function u8ToBinStr(u8) {
+  if (!u8 || u8.length === 0) return '';
+  return Buffer.from(u8.buffer, u8.byteOffset, u8.byteLength).toString('latin1');
+}
+
+function binStrToU8(s) {
+  return new Uint8Array(Buffer.from(String(s == null ? '' : s), 'latin1'));
+}
+
 function concatU8(arrays) {
   let total = 0;
   for (let i = 0; i < arrays.length; i++) total += arrays[i].length;
@@ -104,7 +123,9 @@ function domainToUnicode(domain) {
 
 // Split "local@domain" once at the final '@'. Quoted local-parts containing
 // '@' are tolerated — we walk the string honoring \" escapes. Returns
-// { local, domain } or null if no '@' was found.
+// { local, domain } or null if no '@' was found, or if either side is empty
+// (RFC 5321 §4.1.2 — both Local-part and Domain must be non-empty, so
+// '@example.com' and 'user@' are rejected rather than half-parsed).
 function splitAddress(addr) {
   if (!addr) return null;
   let s = String(addr);
@@ -116,7 +137,7 @@ function splitAddress(addr) {
     if (c === 0x22 /* " */) { inQuote = !inQuote; continue; }
     if (c === 0x40 /* @ */ && !inQuote) at = i;
   }
-  if (at < 0) return null;
+  if (at <= 0 || at === s.length - 1) return null;
   return { local: s.substring(0, at), domain: s.substring(at + 1) };
 }
 
@@ -149,6 +170,8 @@ export {
   TE,
   toU8,
   u8ToStr,
+  u8ToBinStr,
+  binStrToU8,
   concatU8,
   u8Equal,
   hasNonAscii,

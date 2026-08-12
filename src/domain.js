@@ -232,11 +232,23 @@ function generateKeyPair(algo) {
   return { privateKey: pair.privateKey, publicKey: pair.publicKey };
 }
 
+// Derive the PUBLIC key from a private key the operator supplied.
+//
+// A private KeyObject cannot be exported as 'spki' — that type describes a
+// public key, and Node rejects it with "The property 'options.type' is
+// invalid". The whole function therefore threw and returned null for every
+// bring-your-own key, which is the normal case when migrating a domain or
+// rotating a selector. The consequence was silent and severe: publicKey and
+// dnsValue came back null, so material.requiredDNS carried NO DKIM record.
+// Signing still worked, so outbound mail went out signed — against a key
+// nobody could publish, and every receiver reported DKIM failure.
+//
+// crypto.createPublicKey() accepts a private key and returns its public
+// half, which is what actually has an SPKI encoding.
 function extractPublicKey(privateKeyPem, algo) {
   try {
-    let keyObj = crypto.createPrivateKey(privateKeyPem);
-    let pubPem = keyObj.export({ type: 'spki', format: 'pem' });
-    return pubPem;
+    let pubObj = crypto.createPublicKey(privateKeyPem);
+    return pubObj.export({ type: 'spki', format: 'pem' });
   } catch(e) {
     return null;
   }

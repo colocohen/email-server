@@ -201,7 +201,17 @@ function sendMail(options, cb) {
   let envFrom = extractAddress(options.from);
   let envTo = extractAddressList([].concat(options.to || []).concat(options.cc || []).concat(options.bcc || []));
 
-  if (!envFrom || envTo.length === 0) return cb(new Error('Missing from or to'));
+  // An EMPTY sender is not a missing sender: "MAIL FROM:<>" is the null
+  // return-path, and RFC 3461 §6 REQUIRES it for delivery status
+  // notifications so that a bouncing bounce cannot generate another bounce.
+  // Rejecting it here meant server.sendDsn() could never send anything — it
+  // failed with "Missing from or to" on every call. `from: ''` is therefore
+  // an explicit, valid choice; only `undefined`/`null` mean "not supplied".
+  let nullReturnPath = (options.from === '' || options.from === null) && options.from !== undefined;
+  if (nullReturnPath) envFrom = '';
+  if ((envFrom === null || envFrom === undefined) || envTo.length === 0) {
+    return cb(new Error('Missing from or to'));
+  }
 
   let messageId = composed ? composed.messageId : (options.messageId || null);
 

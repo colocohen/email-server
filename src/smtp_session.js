@@ -172,6 +172,12 @@ function SMTPSession(options) {
     caps.push('SMTPUTF8');
     caps.push('DSN');                        // RFC 3461 — delivery status notifications
     caps.push('ENHANCEDSTATUSCODES');
+    // CHUNKING (RFC 3030) — BDAT is fully implemented below (STATE.BDAT and
+    // the BDAT frame parser), but without advertising the capability no client
+    // will ever send BDAT, so that code was unreachable. Advertising it lets
+    // senders skip dot-stuffing entirely, which matters for large or binary
+    // messages.
+    caps.push('CHUNKING');
 
     if (context.advertiseTLS) {
       caps.push('STARTTLS');
@@ -265,6 +271,8 @@ function SMTPSession(options) {
         spf: null,
         dmarc: null,
         dmarcPolicy: null,
+        dmarcPct: null,        // owner's pct= rollout percentage (0-100)
+        dmarcApplies: null,    // is THIS message inside that sample?
         rdns: null,
         rdnsHostname: null,
         dkimDomain: null
@@ -288,14 +296,21 @@ function SMTPSession(options) {
         if (mailObject._rejected) return;
         mailObject._bodyEmitted = true;
 
-        // Emit data (the full body as one chunk)
-        mailEv.emit('data', rawU8);
+        // Emit data (the full body as one chunk). Read the CURRENT
+        // mailObject.raw rather than the rawU8 closure captured at DATA
+        // time: the server layer prepends the Received: trace header to
+        // mail.raw (RFC 5321 §4.4) before _emitBody runs, and the streamed
+        // bytes must match — otherwise developers following the streaming
+        // pattern store messages without their trace header.
+        let emitBytes = (mailObject.raw instanceof Uint8Array || Buffer.isBuffer(mailObject.raw))
+                      ? mailObject.raw : rawU8;
+        mailEv.emit('data', emitBytes);
 
         // Parse body for convenience fields
         let parsed = null;
         try {
           // Import parseMessage dynamically to avoid circular deps
-          parsed = _parseMessage(rawU8);
+          parsed = _parseMessage(emitBytes);
         } catch(e) {}
 
         if (parsed) {
@@ -363,6 +378,26 @@ function SMTPSession(options) {
       out[w++] = body[i];
     }
     return out.slice(0, w);
+  }
+
+  // Inverse of undotStuff — client-side SMTP transparency (RFC 5321 §4.5.2):
+  // a '.' at the start of a line is doubled on the wire. Operates on bytes.
+  function dotStuff(buf) {
+    // Count insertions first to allocate once.
+    let extra = (buf.length > 0 && buf[0] === 46) ? 1 : 0;
+    for (let i = 2; i < buf.length; i++) {
+      if (buf[i] === 46 && buf[i - 1] === 10 && buf[i - 2] === 13) extra++;
+    }
+    if (extra === 0) return buf;
+    let out = Buffer.allocUnsafe(buf.length + extra);
+    let w = 0;
+    if (buf.length > 0 && buf[0] === 46) out[w++] = 46;
+    out[w++] = buf[0];
+    for (let i = 1; i < buf.length; i++) {
+      if (buf[i] === 46 && buf[i - 1] === 10 && i >= 2 && buf[i - 2] === 13) out[w++] = 46;
+      out[w++] = buf[i];
+    }
+    return out;
   }
 
   // Normalize line endings: bare \n → \r\n, bare \r → \r\n
@@ -994,7 +1029,11 @@ function SMTPSession(options) {
     let parsed = parseReplyBlock(replyData);
     let fn = context.pendingReply;
     context.pendingReply = null;
-    fn(parsed);
+    // Defensive: a reply can arrive with no reader registered (e.g. the
+    // pre-fix quit() sent QUIT without one; a misbehaving server can also
+    // volunteer an unsolicited reply). Crashing the whole client process on
+    // `fn(...)` with fn=null turns a peer quirk into a local outage.
+    if (fn) fn(parsed);
   }
 
   function clientReadReply(onReply) {
@@ -1072,6 +1111,11 @@ function SMTPSession(options) {
   // ============================================================
 
   function clientMailFrom(address, params, cb) {
+    // Allow the 2-arg form (address, cb) — matches every sibling client
+    // method (rcptTo, data, authPlain); params stays optional.
+    if (typeof params === 'function') { cb = params; params = null; }
+    params = params || {};
+    cb = cb || function() {};
     let line = 'MAIL FROM:<' + address + '>';
     if (params && params.size)       line += ' SIZE=' + params.size;
     if (params && params.body)       line += ' BODY=' + params.body;
@@ -1116,11 +1160,15 @@ function SMTPSession(options) {
     clientReadReply(function(reply) {
       if (reply.code !== 354) return cb(new Error('DATA rejected: ' + reply.code));
 
-      // Dot-stuff and send body
-      let str = (rawMessage instanceof Uint8Array) ? u8ToStr(rawMessage) :
-                (Buffer.isBuffer(rawMessage)) ? rawMessage.toString('utf-8') : String(rawMessage);
-      let stuffed = str.replace(/\r\n\./g, '\r\n..');
-      send(stuffed + '\r\n.\r\n');
+      // Dot-stuff and send body — at the BYTE level. Decoding to UTF-8 here
+      // mangled any non-UTF8 octet (Latin-1 é → U+FFFD) before it ever hit
+      // the wire, corrupting relayed 8-bit mail and breaking any DKIM
+      // signature already on the message. Same octet-preservation rule as
+      // dkim.js; the inverse of undotStuff() above.
+      let msgBuf = Buffer.isBuffer(rawMessage) ? rawMessage :
+                   (rawMessage instanceof Uint8Array) ? Buffer.from(rawMessage) :
+                   Buffer.from(String(rawMessage), 'utf-8');
+      send(Buffer.concat([dotStuff(msgBuf), Buffer.from('\r\n.\r\n')]));
 
       clientReadReply(function(reply2) {
         if (reply2.code === 250) {
@@ -1134,8 +1182,15 @@ function SMTPSession(options) {
     });
   }
 
-  function clientQuit() {
+  function clientQuit(cb) {
     clientSendLine('QUIT');
+    // Register a reader for the server's 221 goodbye. Without it the reply
+    // hit feedClient with pendingReply=null (process crash pre-guard), and
+    // callers had no way to know the session ended cleanly.
+    clientReadReply(function(reply) {
+      context.state = STATE.CLOSING;
+      if (cb) cb(null, reply);
+    });
     context.state = STATE.CLOSING;
   }
 

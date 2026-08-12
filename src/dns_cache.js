@@ -84,7 +84,23 @@ function lookup(type, name, cb) {
   if (waiters) { waiters.push(cb); return; }
   inFlight.set(key, [cb]);
 
-  resolver(name, function(err, data) {
+  // Node's resolver THROWS synchronously on a malformed argument — a PTR
+  // lookup of something that is not an IP raises EINVAL rather than calling
+  // back with an error. Since every caller here reaches us from network
+  // input (a client's HELO name, a PROXY header, an SPF record), an
+  // unguarded throw turns a malformed remote value into a process crash.
+  // Report it through the callback like any other lookup failure.
+  let launched = false;
+  try {
+    resolver(name, onResolved);
+    launched = true;
+  } catch (e) {
+    inFlight.delete(key);
+    return cb(e);
+  }
+  if (!launched) return;
+
+  function onResolved(err, data) {
     if (!err && data) {
       cacheSet(key, { data: data, expires: Date.now() + DEFAULT_TTL });
     } else if (err && (err.code === 'ENOTFOUND' || err.code === 'ENODATA')) {
@@ -95,7 +111,7 @@ function lookup(type, name, cb) {
     let cbs = inFlight.get(key) || [];
     inFlight.delete(key);
     for (let i = 0; i < cbs.length; i++) cbs[i](err, data);
-  });
+  }
 }
 
 // Convenience wrappers

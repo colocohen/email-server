@@ -98,6 +98,7 @@ export function registerFolderHandlers(s) {
     context.currentFolderReadOnly = false;
     context.currentFolderUidValidity = null;
     context.currentFolderTotal = 0;
+    context.savedSearchResult = null;    // RFC 5182 — "$" is mailbox-scoped
     // Phase 3 will also clear sequence↔UID mapping here.
   }
 
@@ -359,7 +360,13 @@ export function registerFolderHandlers(s) {
       // Apply defaults
       let flags          = info.flags          || DEFAULT_FLAGS;
       let permanentFlags = info.permanentFlags || DEFAULT_FLAGS.concat(['*']);
-      let total          = info.total != null ? info.total : 0;
+      // `total` is the documented field, but the WIRE calls this EXISTS and
+      // the client side of this same library reports it as `exists` — so a
+      // developer who copied the shape from one side to the other got a
+      // silent 0. Accept either spelling (same accept-both-shapes principle
+      // used for copyMessages/move results).
+      let total          = info.total != null ? info.total
+                         : (info.exists != null ? info.exists : 0);
       let recent         = info.recent != null ? info.recent : 0;
       let uidValidity    = info.uidValidity != null ? info.uidValidity : 1;
       let uidNext        = info.uidNext     != null ? info.uidNext     : 1;
@@ -388,6 +395,7 @@ export function registerFolderHandlers(s) {
       context.currentFolderUidValidity  = uidValidity;
       context.currentFolderTotal        = total;
       context.currentFolderHighestModseq = highestModseq;
+      context.savedSearchResult         = null;   // RFC 5182 — "$" is per-mailbox
 
       let code = readOnly ? 'READ-ONLY' : 'READ-WRITE';
       let cmdName = readOnly ? 'EXAMINE' : 'SELECT';
@@ -677,16 +685,36 @@ export function registerFolderHandlers(s) {
     sendUntagged('STATUS ' + quoteMailbox(name) + ' (' + parts.join(' ') + ')');
   }
 
-  // --- CLOSE (discards deletions, exits SELECTED) ---
+  // --- CLOSE (expunges \Deleted, exits SELECTED) ---
   function handleClose(tag) {
     if (!requireAuth(tag)) return;
     if (context.state !== STATE.SELECTED) {
       sendTagged(tag, 'BAD', 'No folder selected');
       return;
     }
-    // Phase 4 will emit 'expunge' here for non-read-only; Phase 2 just closes.
-    exitSelected();
-    sendTagged(tag, 'OK', 'CLOSE completed');
+    // RFC 3501 §6.4.2 — CLOSE "permanently removes all messages that have
+    // the \Deleted flag set" before returning to authenticated state
+    // (UNSELECT, below, is the variant that never expunges). Clients like
+    // Thunderbird rely on this for compact-on-close. Skipped when the
+    // mailbox was opened read-only (EXAMINE — no permanent-state changes
+    // allowed) or when no expunge handler exists to act on it. listenerCount
+    // is checked here (optional-event pattern) so guardedEmit never turns a
+    // handler-less CLOSE into a NO.
+    if (context.currentFolderReadOnly || ev.listenerCount('expunge') === 0) {
+      exitSelected();
+      sendTagged(tag, 'OK', 'CLOSE completed');
+      return;
+    }
+    let closingFolder = context.currentFolder;
+    ev.emit('expunge', closingFolder, null, function(err) {
+      // Per RFC 3501 §6.4.2 no untagged EXPUNGE responses are sent for
+      // CLOSE — the client is leaving the mailbox and isn't tracking
+      // sequence numbers anymore. An expunge error still completes the
+      // CLOSE (the state transition is what the client asked for); the
+      // developer's handler is where the failure is observable.
+      exitSelected();
+      sendTagged(tag, 'OK', 'CLOSE completed');
+    });
   }
 
   // --- UNSELECT (RFC 3691) — like CLOSE but never expunges ---
@@ -806,7 +834,7 @@ export function registerFolderHandlers(s) {
     if (args && args.length >= 1) {
       isUidExpunge = true;
       let setStr = getStringValue(args[0]);
-      let parsed = parseSequenceSet(setStr, { isUid: true, total: context.currentFolderTotal });
+      let parsed = parseSequenceSet(setStr, { isUid: true, total: context.currentFolderTotal, savedSearch: context.savedSearchResult });
       if (parsed.error) {
         sendTagged(tag, 'BAD', 'Invalid UID set: ' + parsed.error);
         return;
@@ -857,7 +885,7 @@ export function registerFolderHandlers(s) {
 
     let setStr = getStringValue(args[0]);
     let dst    = getMailboxName(args[1]);
-    let parsed = parseSequenceSet(setStr, { isUid: byUid, total: context.currentFolderTotal });
+    let parsed = parseSequenceSet(setStr, { isUid: byUid, total: context.currentFolderTotal, savedSearch: context.savedSearchResult });
     if (parsed.error) {
       sendTagged(tag, 'BAD', 'Invalid sequence set: ' + parsed.error);
       return;

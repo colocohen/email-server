@@ -31,7 +31,7 @@
 // ============================================================================
 
 import { TOK } from './imap_wire.js';
-import { parseSearchCriteria } from './imap_helpers.js';
+import { parseSearchCriteria, compressUids } from './imap_helpers.js';
 
 
 export function registerSearchHandlers(s) {
@@ -42,15 +42,39 @@ export function registerSearchHandlers(s) {
   const requireSelected = s.requireSelected;
 
   // --- SEARCH / UID SEARCH ---
+  //
+  // Three RFCs meet in this one command:
+  //   RFC 3501 §6.4.4 — the base form, answered with "* SEARCH n n n"
+  //   RFC 4731        — SEARCH RETURN (MIN MAX ALL COUNT), answered with
+  //                     "* ESEARCH (TAG "a1") [UID] MIN n MAX n ALL 1:5 COUNT n"
+  //   RFC 5182        — RETURN (SAVE) stores the result set under "$", which
+  //                     later commands reference in place of a sequence set
+  //
+  // RETURN is what distinguishes them: absent, the reply is the classic
+  // untagged SEARCH line, exactly as before. Present, the reply is ESEARCH.
+  // Clients that never send RETURN see no change at all.
   function handleSearch(tag, args, byUid) {
     if (!requireSelected(tag)) return;
+
+    let start = 0;
+
+    // Optional RETURN (...) — must come first, before CHARSET (RFC 4731 §3.1)
+    let returnOpts = null;
+    if (args.length >= 2 && String(args[0].value || '').toUpperCase() === 'RETURN' &&
+        args[1] && args[1].type === TOK.LIST) {
+      returnOpts = parseReturnOptions(args[1]);
+      if (!returnOpts) {
+        sendTagged(tag, 'BAD', 'Invalid SEARCH RETURN options');
+        return;
+      }
+      start = 2;
+    }
 
     // Optional CHARSET argument per RFC 3501 §6.4.4:
     //   SEARCH [CHARSET <charset>] <criteria...>
     // We accept and ignore it — the developer's matcher is charset-agnostic.
-    let start = 0;
-    if (args.length >= 2 && String(args[0].value || '').toUpperCase() === 'CHARSET') {
-      start = 2;
+    if (args.length >= start + 2 && String(args[start].value || '').toUpperCase() === 'CHARSET') {
+      start += 2;
     }
     if (start >= args.length) {
       sendTagged(tag, 'BAD', 'SEARCH requires criteria');
@@ -85,25 +109,86 @@ export function registerSearchHandlers(s) {
       //                                 type); previously this yielded an
       //                                 EMPTY "* SEARCH" with zero feedback.
       let nums = [];
+      let uidsForSave = [];
       let highestModseq = 0;
       for (let i = 0; i < results.length; i++) {
         let r = results[i];
         if (r == null) continue;
-        if (typeof r === 'number') { nums.push(r); continue; }
+        if (typeof r === 'number') { nums.push(r); uidsForSave.push(r); continue; }
         let n = byUid ? r.uid : r.seq;
         if (typeof n === 'number') nums.push(n);
+        // SEARCHRES stores UIDs when available so the saved set survives the
+        // sequence renumbering that an EXPUNGE causes (RFC 5182 §2.1).
+        if (typeof r.uid === 'number') uidsForSave.push(r.uid);
+        else if (typeof n === 'number') uidsForSave.push(n);
         if (typeof r.modseq === 'number' && r.modseq > highestModseq) highestModseq = r.modseq;
       }
 
-      let respLine = 'SEARCH' + (nums.length ? ' ' + nums.join(' ') : '');
-      // Append (MODSEQ N) search-result option when required or when developer supplied it
-      if ((hasModseqCriterion || context.condstoreEnabled) && highestModseq > 0) {
-        respLine += ' (MODSEQ ' + highestModseq + ')';
+      // RFC 5182 — RETURN (SAVE) records the result for later "$" references.
+      if (returnOpts && returnOpts.save) {
+        context.savedSearchResult = { uids: uidsForSave.slice(), byUid: byUid };
       }
 
-      sendUntagged(respLine);
+      if (returnOpts) {
+        sendEsearchResponse(tag, byUid, nums, returnOpts, hasModseqCriterion, highestModseq);
+      } else {
+        let respLine = 'SEARCH' + (nums.length ? ' ' + nums.join(' ') : '');
+        // Append (MODSEQ N) search-result option when required or when developer supplied it
+        if ((hasModseqCriterion || context.condstoreEnabled) && highestModseq > 0) {
+          respLine += ' (MODSEQ ' + highestModseq + ')';
+        }
+        sendUntagged(respLine);
+      }
       sendTagged(tag, 'OK', (byUid ? 'UID ' : '') + 'SEARCH completed');
     });
+  }
+
+  // Parse the RETURN (...) option list. Returns null on an unknown option so
+  // the caller can answer BAD rather than silently ignoring what the client
+  // asked for. An EMPTY list is legal and means ALL (RFC 4731 §3.1).
+  function parseReturnOptions(listTok) {
+    let opts = { min: false, max: false, all: false, count: false, save: false };
+    let any = false;
+    for (let i = 0; i < listTok.value.length; i++) {
+      let t = listTok.value[i];
+      if (!t) return null;
+      let name = String(t.value || '').toUpperCase();
+      if      (name === 'MIN')   opts.min = true;
+      else if (name === 'MAX')   opts.max = true;
+      else if (name === 'ALL')   opts.all = true;
+      else if (name === 'COUNT') opts.count = true;
+      else if (name === 'SAVE')  opts.save = true;
+      else return null;
+      any = true;
+    }
+    // "RETURN ()" — default to ALL. Likewise "RETURN (SAVE)" alone: the
+    // client wants the set stored but no data echoed back (§2.1), so ALL
+    // stays off in that case.
+    if (!any) opts.all = true;
+    return opts;
+  }
+
+  // Build "* ESEARCH (TAG "<tag>") [UID] MIN n MAX n ALL <set> COUNT n".
+  // Items appear only when requested. Per RFC 4731 §3.1 an empty result set
+  // omits MIN/MAX/ALL entirely (COUNT 0 is still sent when asked).
+  function sendEsearchResponse(tag, byUid, nums, opts, hasModseq, highestModseq) {
+    let parts = ['(TAG "' + tag + '")'];
+    if (byUid) parts.push('UID');
+
+    if (nums.length > 0) {
+      if (opts.min) parts.push('MIN ' + Math.min.apply(null, nums));
+      if (opts.max) parts.push('MAX ' + Math.max.apply(null, nums));
+      if (opts.all) parts.push('ALL ' + compressUids(nums));
+    }
+    if (opts.count) parts.push('COUNT ' + nums.length);
+    if ((hasModseq || context.condstoreEnabled) && highestModseq > 0) {
+      parts.push('MODSEQ ' + highestModseq);
+    }
+
+    // A RETURN (SAVE)-only request produces no data items — the tagged OK is
+    // the whole answer, so skip the untagged line rather than emit a bare tag.
+    if (parts.length === 1 || (parts.length === 2 && byUid)) return;
+    sendUntagged('ESEARCH ' + parts.join(' '));
   }
 
   // Walk a criteria tree looking for any MODSEQ predicate.

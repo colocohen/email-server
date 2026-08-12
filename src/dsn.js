@@ -64,7 +64,26 @@ function buildDsn(options) {
   const arrival = options.arrivalDate ? formatDate(options.arrivalDate) : formatDate(new Date());
   const originalMsg = options.originalMessage || Buffer.alloc(0);
   const returnContent = (options.returnContent || 'headers').toLowerCase();
-  const recipients = Array.isArray(options.recipients) ? options.recipients : [];
+  let recipients = Array.isArray(options.recipients) ? options.recipients : [];
+
+  // Single-recipient shorthand: accept per-recipient fields at the top level
+  // (finalRecipient / action / status / diagnostic|diagnosticCode / ...).
+  // Previously these were silently IGNORED — the synthesized fallback block
+  // then carried "Status: 5.0.0" instead of the caller's status, and bounce
+  // trackers parsing the DSN (RFC 3464 §2.3.3 makes Status REQUIRED) saw
+  // wrong data with zero feedback that the options shape was off.
+  if (recipients.length === 0 && (options.finalRecipient || options.action || options.status)) {
+    recipients = [{
+      finalRecipient:    options.finalRecipient,
+      originalRecipient: options.originalRecipient,
+      action:            options.action,
+      status:            options.status,
+      diagnostic:        options.diagnostic || options.diagnosticCode,
+      remoteMta:         options.remoteMta,
+      lastAttempt:       options.lastAttempt,
+      willRetryUntil:    options.willRetryUntil
+    }];
+  }
 
   // Pick an overall action word for the subject line — 'failed' beats
   // 'delayed' beats 'delivered' since a bounce is the most urgent signal.
@@ -121,7 +140,9 @@ function buildDsn(options) {
     out += '\r\n';
     out += extractHeaders(originalMsg);
     out += '\r\n--' + boundary + '--\r\n';
-    return Buffer.from(out, 'utf-8');
+    // 'latin1' round-trips the octets extractHeaders preserved; the rest of
+    // `out` is ASCII, for which both encodings are identical.
+    return Buffer.from(out, 'latin1');
   }
 }
 
@@ -187,7 +208,10 @@ function deliveryStatusBlock(mta, envid, arrival, recipients) {
 // Used when the sender asked for RET=HDRS (returnContent === 'headers').
 function extractHeaders(raw) {
   if (!raw || raw.length === 0) return '';
-  let s = raw.toString('utf-8');
+  // latin1, not utf-8 — the header block of an SMTPUTF8 message (RFC 6532)
+  // may itself carry 8-bit octets, and a DSN must quote them unchanged.
+  let s = Buffer.isBuffer(raw) ? raw.toString('latin1') :
+          (raw instanceof Uint8Array ? Buffer.from(raw).toString('latin1') : String(raw));
   let end = s.indexOf('\r\n\r\n');
   if (end < 0) return s;
   return s.substring(0, end + 2);
@@ -243,7 +267,14 @@ function formatDate(d) {
 function parseDsn(raw) {
   let buf = Buffer.isBuffer(raw) ? raw :
             (raw instanceof Uint8Array ? Buffer.from(raw) : Buffer.from(String(raw), 'utf-8'));
-  let s = buf.toString('utf-8');
+  // Byte-preserving decode (latin1: byte <-> char-code 1:1). A UTF-8 decode
+  // here replaces every non-UTF8 octet with U+FFFD, and since the message/rfc822
+  // part carries the ORIGINAL bounced message verbatim, that silently destroys
+  // its body — a bounce handler inspecting or re-sending it gets corrupted
+  // bytes, and any DKIM signature on the original stops verifying. All the
+  // structural parsing below (boundaries, header names, CRLF) is ASCII-only,
+  // so it behaves identically on a latin1 string. Same rule as dkim.js.
+  let s = buf.toString('latin1');
 
   // --- Top-level headers ---
   let headEnd = s.indexOf('\r\n\r\n');
@@ -321,7 +352,9 @@ function parseDsn(raw) {
     }
 
     if (p.contentType.indexOf('message/rfc822') === 0) {
-      out.originalMessage = Buffer.from(p.body, 'utf-8');
+      // Re-encode with the same byte-preserving codec used to decode, so the
+      // returned Buffer is octet-identical to what arrived on the wire.
+      out.originalMessage = Buffer.from(p.body, 'latin1');
       let ohEnd = p.body.indexOf('\r\n\r\n');
       out.originalMessageHeaders = ohEnd >= 0 ? p.body.slice(0, ohEnd) : p.body;
       continue;

@@ -45,9 +45,45 @@ function evaluateDMARC(fromDomain, dmarcDomain, records, options, cb) {
   }
 
   let tags = parseTags(dmarcRecord, true);
-  let policy = tags.p || 'none';
   let adkim = tags.adkim || 'r';
   let aspf = tags.aspf || 'r';
+
+  // --- Policy selection: p= vs sp= (RFC 7489 §6.3) ---
+  //
+  // A domain owner may set a DIFFERENT policy for subdomains. When the record
+  // was found on the organizational domain but the message came from one of
+  // its subdomains, sp= wins over p=. Ignoring sp= applied the parent's
+  // policy to subdomains against the owner's explicit instruction — in both
+  // directions: rejecting mail from a subdomain the owner had exempted
+  // (sp=none), or waving through a subdomain they wanted quarantined.
+  //
+  // `dmarcDomain` is the domain the record was actually found on; checkDMARC
+  // already falls back from the From domain to the organizational domain, so
+  // a difference between the two is exactly the subdomain case.
+  let policy = tags.p || 'none';
+  let isSubdomain = fromDomain.toLowerCase() !== dmarcDomain.toLowerCase();
+  if (isSubdomain && tags.sp) policy = tags.sp;
+
+  // --- pct= : the rollout dial (RFC 7489 §6.3) ---
+  //
+  // "Apply this policy to N% of messages." Every organization ramps DMARC up
+  // this way: p=reject; pct=5, then 20, then 50, then 100. A receiver that
+  // ignores pct enforces at 100% from day one and rejects mail the domain
+  // owner explicitly asked it to let through — legitimate mail, lost, during
+  // exactly the period the owner is trying to measure.
+  //
+  // The sampling decision is made HERE (one random draw per message) but is
+  // NOT applied automatically: `policy` still reports what the owner asked
+  // for, and `applies` says whether THIS message fell inside the sample.
+  // That keeps the library's contract — it measures, you decide — while
+  // making the correct check a single field away.
+  let pct = 100;
+  if (tags.pct != null) {
+    let parsed = parseInt(tags.pct, 10);
+    if (!isNaN(parsed) && parsed >= 0 && parsed <= 100) pct = parsed;
+  }
+  // p=none is advisory anyway, so sampling it would be meaningless.
+  let applies = (policy === 'none') ? true : (pct >= 100 ? true : (Math.random() * 100 < pct));
 
   let dkimAligned = false;
   if (options.dkimResult === 'pass' && options.dkimDomain) {
@@ -72,7 +108,10 @@ function evaluateDMARC(fromDomain, dmarcDomain, records, options, cb) {
   cb(null, {
     result: dmarcResult,
     domain: fromDomain,
-    policy: policy,
+    policy: policy,          // effective policy — sp= when this is a subdomain
+    pct: pct,                // 0-100, the owner's rollout percentage
+    applies: applies,        // did THIS message fall inside the pct sample?
+    isSubdomain: isSubdomain,
     dkimAligned: dkimAligned,
     spfAligned: spfAligned,
     adkim: adkim,

@@ -207,6 +207,26 @@ function parseSequenceSet(str, ctx) {
   let isUid = !!(ctx && ctx.isUid);
   let total = ctx && ctx.total != null ? ctx.total : 0;
 
+  // RFC 5182 — "$" stands in for the last SEARCH RETURN (SAVE) result. The
+  // caller passes it via ctx.savedSearch ({uids, byUid}); an unset or empty
+  // saved result is NOT an error, it simply matches nothing (§2.1: the
+  // command runs against an empty set rather than failing). The saved set is
+  // stored as UIDs, so it only substitutes cleanly into a UID command —
+  // in a sequence-number command we can't translate without the folder's
+  // current ordering, so we report an error the caller turns into BAD.
+  if (String(str).trim() === '$') {
+    let saved = ctx && ctx.savedSearch;
+    if (!saved || !saved.uids || saved.uids.length === 0) return { ranges: [], error: null };
+    if (!isUid) return { ranges: [], error: '$ requires a UID command' };
+    // Build the flat half-open ranges directly. (compressUids returns the
+    // WIRE string form, not this array form — different shape, same idea.)
+    let savedRanges = [];
+    for (let i = 0; i < saved.uids.length; i++) {
+      flatRanges.add(savedRanges, [saved.uids[i], saved.uids[i] + 1]);
+    }
+    return { ranges: savedRanges, error: null };
+  }
+
   let parts = String(str).split(',');
   let ranges = [];
   for (let i = 0; i < parts.length; i++) {
@@ -345,7 +365,12 @@ function parseInternalDate(str) {
   if (!str) return null;
   let m = /^(\d{1,2})-([A-Za-z]{3})-(\d{4})\s+(\d{2}):(\d{2}):(\d{2})\s*([+-]\d{4})?$/.exec(String(str).trim());
   if (!m) return null;
-  let month = MONTH_NAMES.indexOf(m[2]);
+  // Month name matching is case-INSENSITIVE. RFC 3501 spells INTERNALDATE
+  // months as "Jan".."Dec", but this same file already accepts any casing in
+  // parseSearchDate, and clients do send "JAN"/"jan" — most visibly in the
+  // optional date argument of APPEND. Returning null there made the supplied
+  // date vanish silently and the message get stamped with "now" instead.
+  let month = MONTH_NAMES.indexOf(m[2].charAt(0).toUpperCase() + m[2].slice(1).toLowerCase());
   if (month < 0) return null;
   let d = new Date(Date.UTC(parseInt(m[3]), month, parseInt(m[1]), parseInt(m[4]), parseInt(m[5]), parseInt(m[6])));
   if (m[7]) {

@@ -116,7 +116,7 @@ export function registerMessageHandlers(s) {
 
     // Parse sequence set
     let setStr = getStringValue(args[0]);
-    let parsed = parseSequenceSet(setStr, { isUid: byUid, total: context.currentFolderTotal });
+    let parsed = parseSequenceSet(setStr, { isUid: byUid, total: context.currentFolderTotal, savedSearch: context.savedSearchResult });
     if (parsed.error) {
       sendTagged(tag, 'BAD', 'Invalid sequence set: ' + parsed.error);
       return;
@@ -546,6 +546,22 @@ export function registerMessageHandlers(s) {
         // Empty / unknown — treat as empty body
         onBuffer(Buffer.alloc(0));
       },
+      // Documented alias. The README advertises responder.stream(...) for
+      // large messages; only send({length, stream}) existed, so anyone who
+      // followed the docs got "responder.stream is not a function". Both
+      // argument orders are accepted because both read naturally:
+      //   stream(readable, length)   /   stream(length, readable)
+      stream: function(a, b) {
+        let readable = (a && typeof a.on === 'function') ? a : b;
+        let length   = (typeof a === 'number') ? a : b;
+        if (!readable || typeof readable.on !== 'function' || typeof length !== 'number') {
+          return this.error('stream() needs a readable stream and a byte length');
+        }
+        return this.send({ length: length, stream: readable });
+      },
+      // Same name the POP3 responder uses, so a developer moving between the
+      // two protocols does not have to remember which is which.
+      respond: function(data) { return this.send(data); },
       error: function(msg) {
         if (called) return;
         called = true;
@@ -875,6 +891,15 @@ export function registerMessageHandlers(s) {
   // --- STORE / UID STORE ---
   function handleStore(tag, args, byUid) {
     if (!requireSelected(tag)) return;
+    // RFC 3501 §6.3.2 / §6.4.6 — EXAMINE opens the mailbox read-only; STORE
+    // mutates flags and must be refused. Without this guard the developer's
+    // setFlags handler fired and the backend was mutated through a session
+    // that explicitly asked for read-only access (same guard as
+    // handleExpunge / handleMove in imap_folders.js).
+    if (context.currentFolderReadOnly) {
+      sendTagged(tag, 'NO', 'Cannot STORE in read-only mailbox (EXAMINE)');
+      return;
+    }
     if (args.length < 3) {
       sendTagged(tag, 'BAD', 'STORE requires sequence set, operation, and flags');
       return;
@@ -926,7 +951,7 @@ export function registerMessageHandlers(s) {
     }
 
     // Parse seq set
-    let parsed = parseSequenceSet(setStr, { isUid: byUid, total: context.currentFolderTotal });
+    let parsed = parseSequenceSet(setStr, { isUid: byUid, total: context.currentFolderTotal, savedSearch: context.savedSearchResult });
     if (parsed.error) {
       sendTagged(tag, 'BAD', 'Invalid sequence set: ' + parsed.error);
       return;
@@ -961,6 +986,13 @@ export function registerMessageHandlers(s) {
       uids: uids,
       flags: flags,
       mode: mode,
+      // Sequence numbers parallel to `uids`, as resolved for THIS session.
+      // Most storage handlers only need the uids and can ignore this, but an
+      // untagged FETCH is addressed by sequence number, so anything that
+      // relays this change to other sessions (see server.js autoNotify)
+      // needs the pairing. Purely additive — existing handlers are unaffected.
+      seqs: messages.map(function(m) { return m.seq; }),
+      silent: !!silent,
       condstoreEnabled: context.condstoreEnabled
     };
     if (unchangedSince != null) query.unchangedSince = unchangedSince;
@@ -1027,7 +1059,7 @@ export function registerMessageHandlers(s) {
     let setStr = getStringValue(args[0]);
     let dst = getMailboxName(args[1]);
 
-    let parsed = parseSequenceSet(setStr, { isUid: byUid, total: context.currentFolderTotal });
+    let parsed = parseSequenceSet(setStr, { isUid: byUid, total: context.currentFolderTotal, savedSearch: context.savedSearchResult });
     if (parsed.error) {
       sendTagged(tag, 'BAD', 'Invalid sequence set: ' + parsed.error);
       return;
