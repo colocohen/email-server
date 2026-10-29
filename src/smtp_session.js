@@ -21,6 +21,15 @@ import {
   parseMailHeaders
 } from './utils.js';
 
+import { decodeEncodedWords } from './message.js';
+
+
+// A header that will not decode is kept as it came rather than lost.
+function decodeSubject(v) {
+  if (v.indexOf('=?') < 0) return v;
+  try { return decodeEncodedWords(v) || v; } catch (e) { return v; }
+}
+
 
 // ============================================================
 //  Constants
@@ -72,6 +81,10 @@ function SMTPSession(options) {
     localAddress: options.localAddress || null,
     isTLS: !!options.isTLS,
     tlsOptions: options.tlsOptions || null,
+    // Client mode: never issue STARTTLS, even when the peer offers it.
+    ignoreTLS: !!options.ignoreTLS,
+    // Server mode: pump() is running (guards re-entry)
+    pumping: false,
 
     // Capabilities to advertise (server) / received (client)
     advertiseTLS: !options.isTLS && !!options.tlsOptions,
@@ -228,12 +241,17 @@ function SMTPSession(options) {
     }
   }
 
-  function startAcceptTimeout() {
+  function startAcceptTimeout(mailObject) {
     if (context.acceptTimeout > 0) {
       context.acceptTimer = setTimeout(function() {
-        // Auto-reject if no accept/reject called
+        // Auto-reject if no accept/reject called. The message is settled
+        // from here on: an accept() arriving late used to send a SECOND
+        // reply (250 after the 451), which the client then read as the answer
+        // to its next command.
+        mailObject._rejected = true;
         sendReply(451, 'Timeout waiting for processing', '4.3.0');
         resetTransaction();
+        pump();
       }, context.acceptTimeout);
     }
   }
@@ -259,7 +277,12 @@ function SMTPSession(options) {
       params: context.mailParams,
 
       // Parsed headers (available immediately)
-      subject: headers.subject || null,
+      // Subject decoded (RFC 2047 encoded-words: =?UTF-8?Q?...?= → text),
+      // as every consumer wants it shown and searched; the header as it came
+      // is in subjectRaw. headerFrom / headerTo stay raw — they are parsed
+      // for addresses (DMARC alignment), not shown.
+      subject: headers.subject != null ? decodeSubject(headers.subject) : null,
+      subjectRaw: headers.subject || null,
       messageId: headers.messageId || null,
       date: headers.date || null,
       headerFrom: headers.from || null,
@@ -334,6 +357,7 @@ function SMTPSession(options) {
         if (context.acceptTimer) { clearTimeout(context.acceptTimer); context.acceptTimer = null; }
         sendReply(250, 'Ok queued', '2.0.0');
         resetTransaction();
+        pump();   // commands the client pipelined after the message
       },
 
       reject: function(code, message) {
@@ -345,10 +369,11 @@ function SMTPSession(options) {
         let enhanced = (Math.floor(code / 100) === 5) ? '5.7.1' : '4.7.1';
         sendReply(code, message, enhanced);
         resetTransaction();
+        pump();   // commands the client pipelined after the message
       }
     };
 
-    startAcceptTimeout();
+    startAcceptTimeout(mailObject);
     ev.emit('message', mailObject);
   }
 
@@ -778,7 +803,32 @@ function SMTPSession(options) {
       return;
     }
 
+    pump();
+  }
+
+  // Process buffered input. Separate from feed() so it can be resumed once
+  // a message is settled (see STATE.MESSAGE below). Re-entry — accept()
+  // called synchronously from the 'message' handler while this loop is
+  // running — is skipped: the running loop sees the new state and carries on.
+  function pump() {
+    if (context.pumping) return;
+    context.pumping = true;
+    try { pumpLoop(); } finally { context.pumping = false; }
+  }
+
+  function pumpLoop() {
+    if (context.state === STATE.CLOSED) return;
+
     while (true) {
+
+      // --- MESSAGE: waiting for accept/reject ---
+      // Commands pipelined after the end of DATA (RFC 2920 — typically QUIT,
+      // or the next MAIL) stay buffered until the message is settled. Their
+      // replies must follow the message's own reply: processed now, a QUIT
+      // answered 221 and closed before the application's accept() came, so
+      // the client never saw the 250, treated a stored message as failed and
+      // sent it again.
+      if (context.state === STATE.MESSAGE) break;
 
       // --- COMMAND mode ---
       if (context.state !== STATE.DATA && context.state !== STATE.BDAT) {
@@ -944,8 +994,12 @@ function SMTPSession(options) {
           if (context.bdatExpect > 0) break; // waiting for more
         }
 
-        // Chunk complete (possibly zero-length)
-        sendReply(250, 'Ok chunk', '2.0.0');
+        // Chunk complete (possibly zero-length). The LAST chunk gets no reply
+        // of its own: its reply is the message's — accept()/reject() — as
+        // with the end of DATA (RFC 3030 §2). Answering it here as well sent
+        // two replies to one command, and every later reply on the session
+        // was read as the answer to the command before it.
+        if (!context.bdatLast) sendReply(250, 'Ok chunk', '2.0.0');
 
         if (context.bdatLast) {
           // Assemble full message
@@ -1218,7 +1272,7 @@ function SMTPSession(options) {
           if (err) { ev.emit('error', err); return; }
 
           // STARTTLS if available and not already TLS
-          if (context.remoteCaps && context.remoteCaps.starttls && !context.isTLS) {
+          if (context.remoteCaps && context.remoteCaps.starttls && !context.isTLS && !context.ignoreTLS) {
             clientStartTLS(function(err) {
               if (err) {
                 // STARTTLS failed, continue without

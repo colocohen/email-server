@@ -729,6 +729,8 @@ import {
 | `idleTimeout` | number | 30000 | Close idle connection after (ms) |
 | `rateLimitPerMinute` | number | 60 | Max messages per domain per minute |
 | `reconnectDelay` | number | 1000 | Min time between connections to same domain |
+| `mtaSts` | boolean | true | Apply the recipient domain's MTA-STS policy (RFC 8461); `false` opts out |
+| `ignoreTLS` | boolean | false | Never issue STARTTLS. When off, a failed STARTTLS handshake falls back to plaintext unless the domain's MTA-STS policy is `enforce` |
 
 ### Server-level events
 
@@ -765,6 +767,7 @@ import {
 | `server.buildDsn(options)` | Build a DSN message (Buffer) without sending |
 | `server.clearTlsCache(servername?)` | Clear SNI cache (use after cert rotation) |
 | `server.forEachMailboxSession(fn)` | Iterate every live IMAP/POP3 session (for push notifications) |
+| `server.setHostname(name)` | Change the server's own name at runtime (banner, EHLO on outgoing mail, Received headers) — for a name known only after boot, e.g. the reverse-DNS name of a discovered address |
 | `server.serializeQueue()` | Snapshot the outbound queue (pending + in-flight) as JSON-safe data |
 | `server.restoreQueue(snapshot)` | Re-ingest a queue snapshot on startup — crash-safe outbound mail |
 
@@ -875,6 +878,8 @@ server.on('smtpSession', session => {
                                 //   "Two directions, one event" below.
 
     mail.subject, mail.messageId, mail.date, mail.headers
+                                // subject is decoded (RFC 2047: =?UTF-8?Q?...?= → text);
+                                // mail.subjectRaw is the header as it arrived
 
     mail.on('data', chunk => {})   // once — the complete message
     mail.on('end', () => {         // after MIME parsing

@@ -400,9 +400,14 @@ function IMAPSession(options) {
     caps.push('IDLE');       // RFC 2177 — long-lived notification channel
     caps.push('UIDPLUS');    // RFC 4315 — APPENDUID, COPYUID, UID EXPUNGE
     caps.push('NAMESPACE');  // RFC 2342 — mailbox namespace discovery
-    caps.push('SORT');                    // RFC 5256
-    caps.push('THREAD=ORDEREDSUBJECT');   // RFC 5256
-    caps.push('THREAD=REFERENCES');       // RFC 5256
+    // SORT / THREAD (RFC 5256) — like MOVE below, only with a handler to
+    // answer them: advertised without one, a client that uses them gets a NO
+    // for every sort or threaded view.
+    if (ev.listenerCount('sort') > 0) caps.push('SORT');
+    if (ev.listenerCount('thread') > 0) {
+      caps.push('THREAD=ORDEREDSUBJECT');
+      caps.push('THREAD=REFERENCES');
+    }
     caps.push('ENABLE');                  // RFC 5161 — feature enablement
     caps.push('CONDSTORE');               // RFC 7162 — conditional store + MODSEQ
     caps.push('QRESYNC');                 // RFC 7162 — quick resync

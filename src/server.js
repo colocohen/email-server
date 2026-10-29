@@ -1,6 +1,5 @@
-
 import net from 'node:net';
-import tls from 'node:tls';
+import tls from 'lemon-tls';
 import zlib from 'node:zlib';
 import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
@@ -295,6 +294,9 @@ function Server(options) {
   function buildServerTlsOptions(extra) {
     let opts = extra || {};
     opts.SNICallback = function(servername, cb) { resolveTlsContext(servername, cb); };
+    // A peer that starts a handshake and stalls would otherwise hold the
+    // connection forever — lemon-tls has no handshake timeout by default.
+    opts.handshakeTimeout = 30000;
     let def = getDefaultTlsMaterial();
     if (def) {
       opts.key  = def.key;
@@ -684,7 +686,10 @@ function Server(options) {
 
     // Close event — propagate to session facade for developer cleanup
     session.on('close', function() {
-      try { socket.end(); } catch(e) {}
+      // Through `transport`: after STARTTLS the last reply (221) is still
+      // queued in the TLS layer — ending the raw socket under it dropped that
+      // reply and broke the TLS session mid-stream.
+      try { transport.end(); } catch(e) {}
       sessionFacade.emit('close');
     });
 
@@ -1063,7 +1068,9 @@ function Server(options) {
 
     // --- close ---
     imapSession.on('close', function() {
-      try { socket.end(); } catch(e) {}
+      // Through `transport`, as for SMTP: after STARTTLS the BYE is still
+      // queued in the TLS layer.
+      try { transport.end(); } catch(e) {}
     });
 
     // Feed socket data into session. The feedFn indirection lets us slip a
@@ -1259,7 +1266,9 @@ function Server(options) {
 
     // --- close ---
     pop3Session.on('close', function() {
-      try { socket.end(); } catch(e) {}
+      // Through `transport`, as for SMTP: after STLS the +OK is still queued
+      // in the TLS layer.
+      try { transport.end(); } catch(e) {}
     });
 
     // Feed socket data into session. Named so STARTTLS can detach it.
@@ -1316,9 +1325,20 @@ function Server(options) {
       }
     }
 
+    // Nagle off (TCP_NODELAY) on every connection, on every port. SMTP, IMAP
+    // and POP3 are command/response, and a reply often goes out in pieces —
+    // EHLO's 250- lines, IMAP's untagged '*' lines before the tagged OK. With
+    // Nagle on, a piece written while an earlier one is unacknowledged waits
+    // for the ACK: a round trip added to the command. Set on the TCP socket,
+    // it stays through a STARTTLS upgrade, which wraps the same socket.
+    function noDelay(socket) {
+      if (typeof socket.setNoDelay === 'function') socket.setNoDelay(true);
+    }
+
     function startTcpServer(port, onConnection) {
       pending++;
       let tcpServer = net.createServer(function(socket) {
+        noDelay(socket);
         onConnection(socket);
       });
       tcpServer.on('error', function(err) { errors.push(err); ev.emit('error', err); onReady(); });
@@ -1332,6 +1352,7 @@ function Server(options) {
       let tlsOpts = buildServerTlsOptions({});
 
       let tlsServer = tls.createServer(tlsOpts, function(socket) {
+        noDelay(socket);
         onConnection(socket);
       });
       tlsServer.on('error', function(err) { errors.push(err); ev.emit('error', err); onReady(); });
@@ -1682,6 +1703,18 @@ function Server(options) {
     listen: listen,
     close: close,
     send: send,
+
+    // Change the server's own name on a running server: the SMTP banner and
+    // EHLO greeting, the name in Received / Authentication-Results headers and
+    // DSNs, and EHLO on outgoing mail. For a name that is only known after
+    // boot — the reverse-DNS name of an address discovered at runtime.
+    // Takes effect for new connections; open ones keep the name they used.
+    setHostname: function(name) {
+      if (!name || typeof name !== 'string') throw new TypeError('setHostname: name must be a non-empty string');
+      context.hostname = name;
+      if (context.pool && typeof context.pool.setLocalHostname === 'function') context.pool.setLocalHostname(name);
+    },
+    get hostname() { return context.hostname; },
 
     // Outbound-queue persistence (bring-your-own-storage for the queue):
     // snapshot the pending outbound messages and re-ingest them on startup,

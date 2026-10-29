@@ -1,6 +1,6 @@
 
 import net from 'node:net';
-import tls from 'node:tls';
+import tls from 'lemon-tls';
 
 import { SMTPSession } from './smtp_session.js';
 import { composeMessage } from './message.js';
@@ -40,6 +40,8 @@ function SMTPConnection(options, cb) {
   let socket = null;
   let session = null;
   let done = false;
+  let tlsStarted = false;   // STARTTLS accepted, handshake under way
+  let secured = false;      // handshake completed
 
   function finish(err, result) {
     if (done) return;
@@ -47,13 +49,25 @@ function SMTPConnection(options, cb) {
     if (err && socket && !socket.destroyed) {
       try { socket.destroy(); } catch(e) {}
     }
+    // The STARTTLS handshake failed — an alert, a reset, a stall: the peer
+    // offered STARTTLS but shares no version or cipher with us (old servers
+    // that speak only CBC or RSA key exchange). For opportunistic MX delivery
+    // (tlsFallback) do what Postfix does — reconnect and deliver without
+    // STARTTLS — instead of losing the MX. Never under MTA-STS enforce
+    // (verifyTLS), and never set for relay delivery, where AUTH would then go
+    // out in the clear.
+    if (err && tlsStarted && !secured && options.tlsFallback && !options.verifyTLS) {
+      SMTPConnection(Object.assign({}, options, { ignoreTLS: true, tlsFallback: false }), cb);
+      return;
+    }
     cb(err, result);
   }
 
   // Create session in client mode
   session = new SMTPSession({
     isServer: false,
-    hostname: localHostname
+    hostname: localHostname,
+    ignoreTLS: !!options.ignoreTLS
   });
 
   // Wire session output to socket with backpressure
@@ -92,11 +106,14 @@ function SMTPConnection(options, cb) {
       rejectUnauthorized: !!options.verifyTLS
     });
 
+    tlsStarted = true;
+
     tlsSocket.on('error', function(err) {
       finish(err);
     });
 
     tlsSocket.once('secureConnect', function() {
+      secured = true;
       // Replace socket and data handler
       socket = tlsSocket;
       tlsSocket.on('data', function(chunk) {
@@ -319,6 +336,8 @@ function deliverToDomainWithPolicy(domain, envFrom, recipients, rawMessage, opti
         localHostname: options.localHostname || 'localhost',
         timeout: options.timeout || 30000,
         ignoreTLS: options.ignoreTLS || false,
+        // Opportunistic TLS: a failed handshake falls back to plaintext.
+        tlsFallback: !enforce,
         // MTA-STS enforce: validated TLS against the MX hostname.
         verifyTLS: enforce,
         tlsServername: mx.exchange

@@ -1,8 +1,8 @@
-
 import { EventEmitter } from 'node:events';
 
 import { SMTPConnection } from './smtp_client.js';
 import * as dnsCache from './dns_cache.js';
+import * as mtaSts from './mta_sts.js';
 
 
 // ============================================================
@@ -47,6 +47,7 @@ function OutboundPool(options) {
     retryDelays:         options.retryDelays         || DEFAULTS.retryDelays,
     localHostname:       options.localHostname       || 'localhost',
     ignoreTLS:           options.ignoreTLS           || false,
+    mtaSts:              options.mtaSts !== false,
     timeout:             options.timeout             || 30000
   };
 
@@ -168,47 +169,90 @@ function OutboundPool(options) {
     pool.stats.lastConnectTime = Date.now();
     pool.stats.activeConnections++;
 
-    getMX(domain, function(err, mxRecords) {
-      if (err) {
-        pool.stats.activeConnections--;
-        return cb(err);
-      }
+    // MTA-STS (RFC 8461), as sendMail applies it: the recipient domain's
+    // policy decides which MX hosts may be used and whether TLS is mandatory.
+    // Only sendMail ran this, so server.send() — which delivers through this
+    // pool — ignored every published policy. Opt out with { mtaSts: false }.
+    if (!settings.mtaSts) return connectWithPolicy(null);
+    mtaSts.getPolicy(domain, function(err, policy) {
+      connectWithPolicy(policy || null);
+    });
 
-      let mxIndex = 0;
+    function connectWithPolicy(policy) {
+      let enforce = !!(policy && policy.mode === 'enforce');
 
-      function tryNextMX() {
-        if (mxIndex >= mxRecords.length) {
+      getMX(domain, function(err, mxRecords) {
+        if (err) {
           pool.stats.activeConnections--;
-          return cb(new Error('All MX failed for ' + domain));
+          return cb(err);
         }
 
-        let mx = mxRecords[mxIndex++];
+        // Under enforce only MX hosts matching the policy may be used at all
+        // (RFC 8461 §5.1). None left → "All MX failed" below, and the message
+        // stays queued rather than going out over an unverified hop.
+        if (enforce) {
+          mxRecords = mxRecords.filter(function(mx) {
+            return mtaSts.mxMatchesPolicy(mx.exchange, policy);
+          });
+        }
 
-        SMTPConnection({
-          host: mx.exchange,
-          port: 25,
-          localHostname: settings.localHostname,
-          timeout: settings.timeout,
-          ignoreTLS: settings.ignoreTLS
-        }, function(err, conn) {
-          if (err) return tryNextMX();
+        let mxIndex = 0;
+        // Why each host failed. "All MX failed" alone says nothing about
+        // whether no host was allowed, none could be reached, or none could
+        // be trusted — and that is the first thing an operator has to know.
+        let failures = [];
 
-          let entry = {
-            conn: conn,
-            busy: false,
-            messageCount: 0,
-            idleTimer: null,
-            alive: true,
-            mx: mx.exchange
-          };
+        function tryNextMX() {
+          if (mxIndex >= mxRecords.length) {
+            pool.stats.activeConnections--;
+            let why = failures.length ? failures.join('; ')
+                    : (enforce ? 'no MX host matches the MTA-STS policy' : 'no MX hosts');
+            let allErr = new Error('All MX failed for ' + domain + (enforce ? ' (MTA-STS enforce)' : '') + ': ' + why);
+            allErr.causes = failures;
+            return cb(allErr);
+          }
 
-          pool.connections.push(entry);
-          cb(null, entry);
-        });
-      }
+          let mx = mxRecords[mxIndex++];
 
-      tryNextMX();
-    });
+          SMTPConnection({
+            host: mx.exchange,
+            port: 25,
+            localHostname: settings.localHostname,
+            timeout: settings.timeout,
+            ignoreTLS: settings.ignoreTLS,
+            // Opportunistic TLS: a failed handshake falls back to plaintext.
+            tlsFallback: !enforce,
+            // MTA-STS enforce: validated TLS against the MX hostname.
+            verifyTLS: enforce,
+            tlsServername: mx.exchange
+          }, function(err, conn) {
+            if (err) { failures.push(mx.exchange + ': ' + (err.message || err)); return tryNextMX(); }
+
+            // Under enforce, TLS is not optional: a connection that did not end
+            // up encrypted may not carry the message (RFC 8461 §4.2).
+            if (enforce && !conn.isTLS) {
+              failures.push(mx.exchange + ': connected but TLS was not established');
+              conn.destroy();
+              return tryNextMX();
+            }
+
+            let entry = {
+              conn: conn,
+              busy: false,
+              messageCount: 0,
+              idleTimer: null,
+              alive: true,
+              mx: mx.exchange
+            };
+
+            pool.connections.push(entry);
+            cb(null, entry);
+          });
+        }
+
+        tryNextMX();
+      });
+    }
   }
 
   function closeConnection(pool, entry) {
@@ -340,6 +384,14 @@ function OutboundPool(options) {
   // ============================================================
 
   function finishMessage(pool, entry, msg, err, info) {
+    settleMessage(pool, msg, err, info);
+
+    // After message: reuse connection or close
+    afterMessageSent(pool, entry);
+  }
+
+  // The message's fate, with or without a connection behind it.
+  function settleMessage(pool, msg, err, info) {
     // The message's fate is decided here in all three cases (retry re-queues
     // it, bounce drops it, success completes it) — leave the in-flight list
     // first so serialize() never double-counts it.
@@ -371,9 +423,6 @@ function OutboundPool(options) {
       if (msg.cb) msg.cb(null, { messageId: msg.messageId, accepted: info.accepted, rejected: info.rejected, mx: info.mx });
       ev.emit('sent', { id: msg.id, messageId: msg.messageId, accepted: info.accepted, mx: info.mx });
     }
-
-    // After message: reuse connection or close
-    afterMessageSent(pool, entry);
   }
 
   function handleSendError(pool, entry, msg, err) {
@@ -541,7 +590,16 @@ function OutboundPool(options) {
       } else if (canOpenConnection(pool)) {
         openConnection(pool, function(err, entry) {
           if (err) {
-            requeue(pool, msg);
+            // No MX of the domain could be reached (or, under MTA-STS
+            // enforce, none could be used). That is a failed delivery
+            // attempt, not a scheduling hiccup: it counts as an attempt and
+            // waits out the retry ladder, and bounces once the ladder is
+            // spent. Re-queued as-is it came back on the next tick — a new
+            // connection attempt every second, forever, and the message
+            // never bounced. The domain backs off as on a 421.
+            pool.stats.backoffUntil = Date.now() + settings.reconnectDelay * 10;
+            settleMessage(pool, msg, err, null);
+            cleanPool(pool.domain);
             return;
           }
           sendMessage(pool, entry, msg);
@@ -766,6 +824,9 @@ function OutboundPool(options) {
   // ============================================================
 
   let api = {
+    // The name given in EHLO on new connections. Connections already open
+    // keep the name they greeted with until they close.
+    setLocalHostname: function(name) { if (name) settings.localHostname = String(name); },
     enqueue: enqueue,
     serialize: serialize,
     restore: restore,
