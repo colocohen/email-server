@@ -28,7 +28,7 @@
 //  envelope recipient is the message's original envelope sender.
 // ============================================================================
 
-import crypto from 'node:crypto';
+import { randomHex } from './random.js';
 
 
 // Build a DSN Buffer. `options` shape:
@@ -97,7 +97,7 @@ function buildDsn(options) {
                 : overall === 'delayed' ? 'Delivery Status Notification (Delay)'
                 : 'Delivery Status Notification';
 
-  const boundary = '=_dsn_' + crypto.randomBytes(12).toString('hex');
+  const boundary = '=_dsn_' + randomHex(12);
 
   let out = '';
   // --- Outer headers ---
@@ -105,7 +105,7 @@ function buildDsn(options) {
   out += 'To: ' + to + '\r\n';
   out += 'Subject: ' + subject + '\r\n';
   out += 'Date: ' + formatDate(new Date()) + '\r\n';
-  out += 'Message-ID: <dsn-' + crypto.randomBytes(8).toString('hex') + '@' + reportingMta + '>\r\n';
+  out += 'Message-ID: <dsn-' + randomHex(8) + '@' + reportingMta + '>\r\n';
   out += 'MIME-Version: 1.0\r\n';
   out += 'Content-Type: multipart/report; report-type=delivery-status;\r\n';
   out += ' boundary="' + boundary + '"\r\n';

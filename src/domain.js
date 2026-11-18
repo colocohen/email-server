@@ -1,6 +1,7 @@
 
-import crypto from 'node:crypto';
+import * as keys from './keys.js';
 import dns from 'node:dns';
+import { spki as SPKI, pem as PEM } from 'cryptographic-formats';
 
 
 // ============================================================
@@ -214,76 +215,41 @@ function buildSelector() {
   return 's' + y + m;
 }
 
+// A new key pair, as PEM (PKCS#8 and SPKI): Ed25519, or RSA-2048 (the default)
 function generateKeyPair(algo) {
-  if (algo === 'ed25519-sha256') {
-    let pair = crypto.generateKeyPairSync('ed25519', {
-      privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
-      publicKeyEncoding: { type: 'spki', format: 'pem' }
-    });
-    return { privateKey: pair.privateKey, publicKey: pair.publicKey };
-  }
-
-  // Default: rsa-sha256
-  let pair = crypto.generateKeyPairSync('rsa', {
-    modulusLength: 2048,
-    privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
-    publicKeyEncoding: { type: 'spki', format: 'pem' }
-  });
-  return { privateKey: pair.privateKey, publicKey: pair.publicKey };
+  return keys.generateKeyPair(algo);
 }
 
-// Derive the PUBLIC key from a private key the operator supplied.
-//
-// A private KeyObject cannot be exported as 'spki' — that type describes a
-// public key, and Node rejects it with "The property 'options.type' is
-// invalid". The whole function therefore threw and returned null for every
-// bring-your-own key, which is the normal case when migrating a domain or
-// rotating a selector. The consequence was silent and severe: publicKey and
-// dnsValue came back null, so material.requiredDNS carried NO DKIM record.
-// Signing still worked, so outbound mail went out signed — against a key
-// nobody could publish, and every receiver reported DKIM failure.
-//
-// crypto.createPublicKey() accepts a private key and returns its public
-// half, which is what actually has an SPKI encoding.
+// The public half of a private key the operator supplied (keys.js computes it), as
+// an SPKI PEM. A bring-your-own key is the normal case when migrating a
+// domain or rotating a selector; a null here would leave material.requiredDNS
+// without the DKIM record while mail still goes out signed.
 function extractPublicKey(privateKeyPem, algo) {
   try {
-    let pubObj = crypto.createPublicKey(privateKeyPem);
-    return pubObj.export({ type: 'spki', format: 'pem' });
+    return keys.privateKey(privateKeyPem).publicKeyPem;
   } catch(e) {
     return null;
   }
 }
 
+// The DKIM TXT value for a PEM public key (read by cryptographic-formats). RSA: p= is
+// the SubjectPublicKeyInfo, in base64 (RFC 6376). Ed25519: p= is the raw
+// 32-byte key (RFC 8463 §4.2) - the SPKI's subjectPublicKey, not the SPKI.
+// null when the PEM is not a public key of that kind: a record that cannot
+// verify anything is not published. (The Ed25519 path fell back to the whole
+// SPKI, which no verifier reads as an Ed25519 key.)
 function buildDkimDnsValue(algo, publicKeyPem) {
   if (!publicKeyPem) return null;
+  let key;
+  try { key = SPKI.from_der(PEM.decode_one(String(publicKeyPem), 'PUBLIC KEY').der); }
+  catch (e) { return null; }
 
-  let k = (algo === 'ed25519-sha256') ? 'ed25519' : 'rsa';
-
-  if (k === 'ed25519') {
-    // Ed25519: DNS needs raw 32-byte public key, not full SPKI
-    try {
-      let keyObj = crypto.createPublicKey(publicKeyPem);
-      let raw = keyObj.export({ type: 'spki', format: 'der' });
-      // SPKI for Ed25519 is 44 bytes: 12 bytes ASN.1 header + 32 bytes key
-      let rawKey = raw.slice(raw.length - 32);
-      let b64 = Buffer.from(rawKey).toString('base64');
-      return 'v=DKIM1; k=ed25519; p=' + b64;
-    } catch(e) {
-      // Fallback: use full PEM base64
-      let b64 = publicKeyPem
-        .replace(/-----BEGIN PUBLIC KEY-----/, '')
-        .replace(/-----END PUBLIC KEY-----/, '')
-        .replace(/\s+/g, '');
-      return 'v=DKIM1; k=ed25519; p=' + b64;
-    }
+  if (algo === 'ed25519-sha256') {
+    if (key.algorithm !== 'Ed25519') return null;
+    return 'v=DKIM1; k=ed25519; p=' + Buffer.from(key.point).toString('base64');
   }
-
-  // RSA: full SPKI DER as base64
-  let b64 = publicKeyPem
-    .replace(/-----BEGIN PUBLIC KEY-----/, '')
-    .replace(/-----END PUBLIC KEY-----/, '')
-    .replace(/\s+/g, '');
-  return 'v=DKIM1; k=rsa; h=sha256; p=' + b64;
+  if (key.algorithm !== 'rsaEncryption') return null;
+  return 'v=DKIM1; k=rsa; h=sha256; p=' + Buffer.from(key.der).toString('base64');
 }
 
 

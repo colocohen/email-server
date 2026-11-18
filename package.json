@@ -1,6 +1,6 @@
 {
   "name": "email-server",
-  "version": "0.2.0",
+  "version": "0.6.0",
   "description": "Easily run your own mail server - complete email infrastructure with full control, in a single Node.js.",
   "main": "index.js",
   "type": "module",
@@ -12,17 +12,17 @@
       "require": "./index.cjs",
       "default": "./index.js"
     },
-    "./wire":     "./src/smtp_wire.js",
-    "./smtp":     "./src/smtp_session.js",
-    "./imap":     "./src/imap_session.js",
-    "./pop3":     "./src/pop3_session.js",
-    "./session":  "./src/smtp_session.js",
-    "./message":  "./src/message.js",
-    "./dkim":     "./src/dkim.js",
-    "./spf":      "./src/spf.js",
-    "./dmarc":    "./src/dmarc.js",
-    "./dsn":      "./src/dsn.js",
-    "./domain":   "./src/domain.js"
+    "./wire": "./src/smtp_wire.js",
+    "./smtp": "./src/smtp_session.js",
+    "./imap": "./src/imap_session.js",
+    "./pop3": "./src/pop3_session.js",
+    "./session": "./src/smtp_session.js",
+    "./message": "./src/message.js",
+    "./dkim": "./src/dkim.js",
+    "./spf": "./src/spf.js",
+    "./dmarc": "./src/dmarc.js",
+    "./dsn": "./src/dsn.js",
+    "./domain": "./src/domain.js"
   },
   "files": [
     "index.js",
@@ -119,7 +119,13 @@
       "url": "https://buymeacoffee.com/colocohen"
     }
   ],
+  "scripts": {
+    "test": "node --test test/"
+  },
   "dependencies": {
-    "flat-ranges": "^2.0.0"
+    "cryptographic-formats": "^0.2.0",
+    "flat-ranges": "^2.3.0",
+    "lemon-tls": "^0.12.0",
+    "cryptographic-primitives": "^0.1.0"
   }
 }

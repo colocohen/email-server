@@ -1,7 +1,9 @@
 
-import crypto from 'node:crypto';
+import { sha256_sync } from 'cryptographic-primitives/sha2.js';
+import * as keys from './keys.js';
 
 import * as dnsCache from './dns_cache.js';
+import { spki as SPKI, pem as PEM } from 'cryptographic-formats';
 import { u8ToBinStr, parseTags, parseMailHeaders } from './utils.js';
 
 
@@ -111,7 +113,10 @@ function canonicalizeBodyRelaxed(body) {
     out.pop();
   }
 
-  if (out.length === 0) return '\r\n';
+  // An empty body is hashed as nothing under relaxed (RFC 6376 §3.4.4,
+  // erratum 1384) - simple is the one that makes it a CRLF. A CRLF here put
+  // a body hash on every empty message that dkimpy and OpenDKIM reject.
+  if (out.length === 0) return '';
   return out.join('\r\n') + '\r\n';
 }
 
@@ -163,6 +168,23 @@ function findHeaderNth(headers, name, n) {
 //  DKIM Sign (RFC 6376)
 // ============================================================
 
+// SHA-256 of a latin1 string's octets — the canonicalized text holds one
+// byte per char ('latin1'), never re-expanded as UTF-8
+function sha256Latin1(text) {
+  let d = sha256_sync(Buffer.from(text, 'latin1'));
+  return Buffer.from(d.buffer, d.byteOffset, d.byteLength);
+}
+
+// The DKIM signing key, which must be of the kind a= names
+function signingKey(privateKey, algorithm) {
+  let key = keys.privateKey(privateKey);
+  if (key.algorithm !== algorithm) {
+    throw new Error('DKIM: a ' + (algorithm === 'Ed25519' ? 'ed25519-sha256' : 'rsa-sha256') + ' signature needs ' +
+                    (algorithm === 'Ed25519' ? 'an Ed25519' : 'an RSA') + ' key, not ' + key.algorithm);
+  }
+  return key;
+}
+
 const DEFAULT_SIGNED_HEADERS = [
   'from', 'to', 'cc', 'subject', 'date', 'message-id',
   'mime-version', 'content-type', 'content-transfer-encoding',
@@ -199,7 +221,7 @@ function sign(rawMessage, options) {
   // Body hash (SHA-256) — encode the canonicalized latin1 string back to its
   // exact octets ('latin1'), never the default 'utf8' which would re-expand
   // chars >= 0x80 into multi-byte sequences the verifier never sees.
-  let bodyHash = crypto.createHash('sha256').update(canonBody, 'latin1').digest('base64');
+  let bodyHash = sha256Latin1(canonBody).toString('base64');
 
   // Determine which headers to sign (only those present in the message)
   let signedHeaderNames = options.signHeaders || DEFAULT_SIGNED_HEADERS;
@@ -247,17 +269,13 @@ function sign(rawMessage, options) {
     // is what this did before: it produced a well-formed signature that every
     // conforming verifier (dkimpy, opendkim, Gmail) rejects, because they hash
     // first. The comment here described the correct behaviour all along.
-    let keyObj = crypto.createPrivateKey(privateKey);
-    let digest = crypto.createHash('sha256').update(signData, 'latin1').digest();
-    signature = crypto.sign(null, digest, keyObj);
+    signature = signingKey(privateKey, 'Ed25519').sign(sha256Latin1(signData));
   } else {
     // RSA-SHA256
-    let signer = crypto.createSign('SHA256');
-    signer.update(signData, 'latin1');
-    signature = signer.sign(privateKey);
+    signature = signingKey(privateKey, 'rsaEncryption').sign(Buffer.from(signData, 'latin1'));
   }
 
-  let b64Sig = signature.toString('base64');
+  let b64Sig = Buffer.from(signature).toString('base64');
 
   // Fold the signature for line length
   let fullDkimValue = dkimHeader + foldB64(b64Sig);
@@ -387,7 +405,7 @@ function verify(rawMessage, cb) {
 
     // Verify body hash
     let canonBody = canonicalizeBody(body, canon.body);
-    let computedBodyHash = crypto.createHash('sha256').update(canonBody, 'latin1').digest('base64');
+    let computedBodyHash = sha256Latin1(canonBody).toString('base64');
 
     if (computedBodyHash !== claimedBodyHash) {
       return done({ result: 'fail', reason: 'Body hash mismatch', domain: domain });
@@ -448,16 +466,15 @@ function verify(rawMessage, cb) {
 
       try {
         let valid = false;
+        let key = keys.publicKey(pubKeyPem);
         if (algo === 'ed25519-sha256') {
+          if (key.algorithm !== 'Ed25519') throw new Error('a=ed25519-sha256 with a ' + key.algorithm + ' key');
           // Mirror of the signing path — verify against the SHA-256 digest
           // of the header block (RFC 8463 §3), not the block itself.
-          valid = crypto.verify(null,
-            crypto.createHash('sha256').update(signData, 'latin1').digest(),
-            pubKeyPem, signatureBuffer);
+          valid = key.verify(sha256Latin1(signData), signatureBuffer);
         } else {
-          let verifier = crypto.createVerify('SHA256');
-          verifier.update(signData, 'latin1');
-          valid = verifier.verify(pubKeyPem, signatureBuffer);
+          if (key.algorithm !== 'rsaEncryption') throw new Error('a=rsa-sha256 with a ' + key.algorithm + ' key');
+          valid = key.verify(Buffer.from(signData, 'latin1'), signatureBuffer);
         }
 
         if (valid) {
@@ -491,28 +508,17 @@ function extractDkimPublicKey(record, algo) {
   return tags.p || null;
 }
 
+// The p= of a DKIM record as a PEM public key. RSA (RFC 6376): p= is the
+// key's SubjectPublicKeyInfo. Ed25519 (RFC 8463 §4.2): p= is the raw 32-byte
+// key, which keys.js reads only inside an SPKI - cryptographic-formats writes it
+// (it was a DER prefix written out here); a p= that is already a whole SPKI
+// is taken as it is. The PEM is cryptographic-formats' too.
 function buildPublicKeyPem(b64Key, algo) {
-  if (algo === 'ed25519-sha256') {
-    // Ed25519: b64Key is raw 32-byte key, wrap in SPKI DER
-    let rawKey = Buffer.from(b64Key, 'base64');
-    if (rawKey.length === 32) {
-      // Build SPKI: OID header (12 bytes) + raw key (32 bytes)
-      let spkiHeader = Buffer.from('302a300506032b6570032100', 'hex');
-      let spkiDer = Buffer.concat([spkiHeader, rawKey]);
-      let spkiB64 = spkiDer.toString('base64');
-      return '-----BEGIN PUBLIC KEY-----\n' + spkiB64 + '\n-----END PUBLIC KEY-----';
-    }
-    // Already full SPKI
-    return '-----BEGIN PUBLIC KEY-----\n' + b64Key + '\n-----END PUBLIC KEY-----';
+  let der = Buffer.from(String(b64Key).replace(/\s+/g, ''), 'base64');
+  if (algo === 'ed25519-sha256' && der.length === 32) {
+    der = Buffer.from(SPKI.to_der({ algorithm: 'Ed25519', point: der }));
   }
-
-  // RSA: b64Key is already SPKI DER
-  // Wrap in PEM with proper line breaks
-  let wrapped = '';
-  for (let i = 0; i < b64Key.length; i += 64) {
-    wrapped += b64Key.slice(i, i + 64) + '\n';
-  }
-  return '-----BEGIN PUBLIC KEY-----\n' + wrapped + '-----END PUBLIC KEY-----';
+  return PEM.encode(der, 'PUBLIC KEY');
 }
 
 

@@ -1,7 +1,7 @@
 import net from 'node:net';
 import tls from 'lemon-tls';
 import zlib from 'node:zlib';
-import crypto from 'node:crypto';
+import { randomHex } from './random.js';
 import { EventEmitter } from 'node:events';
 
 import { SMTPSession } from './smtp_session.js';
@@ -18,6 +18,48 @@ import { checkSPF } from './spf.js';
 import { checkDMARC } from './dmarc.js';
 import { checkFCrDNS } from './rdns.js';
 import { extractAddress, extractAddressList } from './utils.js';
+import { genMessageId, nowRfc2822Date } from './message.js';
+
+
+// Submission: add Date / Message-ID when the client did not (RFC 6409 §8.2–8.3).
+// Inserted just before the blank line that ends the header block; the line
+// ending follows the message's own (CRLF, or bare LF in a malformed one).
+// mail.raw / size / date / messageId are updated in place.
+function completeSubmissionHeaders(mail) {
+  if (mail.date && mail.messageId) return;
+  let add = [];
+  let date = mail.date, messageId = mail.messageId;
+  if (!date) { date = nowRfc2822Date(); add.push('Date: ' + date); }
+  if (!messageId) {
+    let a = extractAddress(mail.headerFrom) || extractAddress(mail.from) || '';
+    messageId = genMessageId(a.substring(a.lastIndexOf('@') + 1));
+    add.push('Message-ID: ' + messageId);
+  }
+
+  let raw = Buffer.isBuffer(mail.raw) ? mail.raw :
+            (mail.raw instanceof Uint8Array ? Buffer.from(mail.raw.buffer, mail.raw.byteOffset, mail.raw.length)
+                                            : Buffer.from(String(mail.raw || ''), 'utf-8'));
+  // End of the header block: the first empty line.
+  let at = -1, eol = '\r\n';
+  for (let i = 0; i < raw.length; i++) {
+    if (raw[i] !== 0x0A) continue;
+    if (raw[i + 1] === 0x0A) { at = i + 1; eol = '\n'; break; }
+    if (raw[i + 1] === 0x0D && raw[i + 2] === 0x0A) { at = i + 1; eol = (i > 0 && raw[i - 1] === 0x0D) ? '\r\n' : '\n'; break; }
+  }
+  let ins;
+  if (at < 0) {
+    // Headers only, no body: append after the last header.
+    at = raw.length;
+    let tail = raw.length > 0 && raw[raw.length - 1] !== 0x0A ? '\r\n' : '';
+    ins = Buffer.from(tail + add.join('\r\n') + '\r\n', 'utf-8');
+  } else {
+    ins = Buffer.from(add.join(eol) + eol, 'utf-8');
+  }
+  mail.raw = Buffer.concat([raw.subarray(0, at), ins, raw.subarray(at)]);
+  mail.size = mail.raw.length;
+  mail.date = date;
+  mail.messageId = messageId;
+}
 
 
 // ============================================================
@@ -527,6 +569,12 @@ function Server(options) {
       }
 
       if (isSubmission) {
+        // Submission (RFC 6409 §8.2–8.3): a client that left out Date or
+        // Message-ID gets them here. Without Date a mail client cannot place
+        // the message in time; without Message-ID threading and duplicate
+        // detection break. Added at the end of the header block, before any
+        // DKIM signing the developer does in 'mail'.
+        completeSubmissionHeaders(mail);
         sessionFacade.emit('mail', mail);
         // After developer registers mail.on('data') / mail.on('end'), trigger body events
         setImmediate(function() { mail._emitBody(); });
@@ -711,7 +759,7 @@ function Server(options) {
   function handleConnection(socket, isSubmission) {
     // Generate connection ID
     let connId = (++context.connectionCounter).toString(36) + '-' +
-      crypto.randomBytes(4).toString('hex');
+      randomHex(4);
 
     let remoteAddress = socket.remoteAddress || null;
 
@@ -1379,7 +1427,7 @@ function Server(options) {
     // --- IMAP ports ---
     function imapConn(s) {
       let connId = (++context.connectionCounter).toString(36) + '-' +
-                   crypto.randomBytes(4).toString('hex');
+                   randomHex(4);
       handleImapConnection(s, s.remoteAddress || null, connId);
     }
     // IMAP (port 143) — plain TCP, supports STARTTLS
@@ -1390,7 +1438,7 @@ function Server(options) {
     // --- POP3 ports ---
     function pop3Conn(s) {
       let connId = (++context.connectionCounter).toString(36) + '-' +
-                   crypto.randomBytes(4).toString('hex');
+                   randomHex(4);
       handlePop3Connection(s, s.remoteAddress || null, connId);
     }
     // POP3 (port 110) — plain TCP, supports STLS
